@@ -18,14 +18,14 @@ What this project adds over existing work ([docs/RESEARCH.md](docs/RESEARCH.md))
 3. **More from the replays.** Lost games as well as won ones, lane mirroring, and a converter from RoyaleAPI replays to crforge.
 4. **Opponent modelling.** A belief over the opponent's unseen cards, used by the policy and by search.
 
-Full plan and milestones: [docs/PLAN.md](docs/PLAN.md). Machine setup: [docs/SETUP.md](docs/SETUP.md).
+Full plan and milestones: [docs/PLAN.md](docs/PLAN.md). Machine setup: [docs/SETUP.md](docs/SETUP.md). Data audit: [docs/DATA.md](docs/DATA.md).
 
 ## Status
 
 | Milestone | State |
 |---|---|
-| M0. Foundations: environment, tests, evaluation harness, throughput | in progress |
-| M1. Data: audit, replay conversion, consistency filter | not started |
+| M0. Foundations: environment, tests, evaluation harness, throughput | done |
+| M1. Data: audit, replay conversion, consistency filter | audit done ([docs/DATA.md](docs/DATA.md)); conversion next |
 | M2. Imitation: generalist, then specialist | not started |
 | M3. PPO league | not started |
 | M4. Search | not started |

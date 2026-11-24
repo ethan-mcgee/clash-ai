@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clashai"
+version = "0.1.0"
+description = "A Clash Royale agent trained to play one deck (Piggies EQ) on the crforge simulator"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+# crforge-env comes from the pinned submodule: pip install third_party/crforge/python
+# PyTorch comes from the CUDA index: see docs/SETUP.md
+dependencies = ["numpy>=1.26", "pyyaml>=6", "pyarrow>=17"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["clashai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The JVM raises access violations on purpose at start-up on Windows; the fault handler would
+# print each as a crash. The cache provider can't write to this machine's temp folder.
+addopts = "-p no:faulthandler -p no:cacheprovider"
+markers = ["engine: needs the built crforge engine and game tables"]

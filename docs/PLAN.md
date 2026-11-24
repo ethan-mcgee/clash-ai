@@ -2,7 +2,7 @@
 
 ## Context
 
-Goal: train one agent to play **one deck, Piggies EQ, extremely well**, on one desktop: an RTX 3090 Ti, 64 GB RAM and a 12-thread CPU. Offline only; it never plays real people.
+Goal: train one agent to play **one deck, Piggies EQ, extremely well**, on one desktop: an RTX 3090 Ti, 64 GB RAM and a 12-core / 24-thread Ryzen 9 7900X (6 / 12 enabled until a BIOS change). Offline only; it never plays real people.
 
 The first plan built on FirstLight_CR. That route is dead: Null's server now forces game version 16, and the content FirstLight needs can't be downloaded any more.
 
@@ -111,7 +111,7 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
 - Package skeleton, environment wrapper, model-input adapter, evaluation harness, held-out deck split.
 - Tests: plays land 20 ticks after they're given; `require_fair` passes; same seeds give identical results; every unmasked action is accepted; mirroring round-trips.
 - A Piggies EQ smoke match: every card, both evolutions and the Archer Queen ability play without a "not modelled" refusal.
-- Throughput at 1, 6 and 12 threads. Check why Windows reports 12 threads on a 24-thread CPU.
+- Throughput at 1, 6 and 12 threads (re-measured at 24 once the BIOS change re-enables all 12 cores / 24 threads).
 - Exit: tests pass; a games-per-hour number; a scripted-bot scorecard with intervals.
 
 **M1. Data**

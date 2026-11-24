@@ -5,7 +5,7 @@ How this project's Windows 11 machine runs crforge and trains on it. crforge's o
 ## Hardware
 
 - GPU: RTX 3090 Ti, 24 GB, NVIDIA driver 621.14
-- CPU: Ryzen 9 7900X. **Windows sees 6 cores / 12 threads, not 12 / 24**: one core cluster appears to be disabled in the BIOS. Throughput below is measured as-is.
+- CPU: Ryzen 9 7900X, 12 cores / 24 threads. **As of 2026-11-24 Windows sees only 6 cores / 12 threads**: one core cluster is disabled in the BIOS. The full 12 / 24 will be re-enabled soon; the throughput below was measured on 6 / 12 and will be re-measured then. Code sizes thread counts from the machine, never a hard-coded 12.
 - RAM: 64 GB
 - Disks: C: is nearly full, so everything large goes on **D:**
 
@@ -80,3 +80,15 @@ cd third_party\crforge\python
 | 12 | 25,624 | 40,492 |
 
   At about 800 decisions a game, 40k steps/s is about 180,000 games an hour from the engine alone. Gains stop near 6 threads, which matches the 6 cores Windows sees.
+
+## This project's package
+
+```powershell
+& $py -m pip install -e ".[dev]"
+& $py -m pytest -q --basetemp=D:/ml-data/clash-ai/tmp/pytest
+& $py -m clashai.eval.scorecard --policy scripted --opponent scripted --seeds 50
+```
+
+- `clashai` sets `JAVA_HOME` to JDK 21 itself (`clashai/paths.py`), so no shell setup is needed. Every location can be overridden with `CLASHAI_DATA`, `CLASHAI_CRFORGE_INSTALL`, `CLASHAI_TABLES` and `CLASHAI_JAVA_HOME`.
+- Tests marked `engine` need the built engine and tables; without them they're skipped, not failed.
+- Scorecards are written to `D:\ml-data\clash-ai\runs\scorecards`.

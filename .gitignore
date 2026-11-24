@@ -14,7 +14,7 @@ game-resources/
 .claude/settings.local.json
 
 # --- Data, caches, checkpoints, run outputs (keep these outside OneDrive) ---
-data/
+/data/
 datasets/
 cache/
 caches/
