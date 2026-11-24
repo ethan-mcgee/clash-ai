@@ -30,7 +30,7 @@ None of the D: folders are in the repo.
 | Python | 3.12.6 | `C:\Python312` |
 | PyTorch | 2.5.1, CUDA 12.4 build | From `https://download.pytorch.org/whl/cu124`; the PyPI wheel on Windows is CPU-only |
 | JDK | Temurin 21.0.13.1 | `winget install --id EclipseAdoptium.Temurin.21.JDK -e`. Your user-level `JAVA_HOME` points at Java 25, so set `JAVA_HOME` to JDK 21 in every shell that runs crforge (below) |
-| crforge-env | 0.1.0 (from `third_party/crforge/python`) | JPype 1.7.1, NumPy 2.5.5 |
+| crforge-env | 0.1.0, editable from `third_party/crforge/python` | JPype 1.7.1, NumPy 2.5.5 |
 
 ## Build crforge and its game tables
 

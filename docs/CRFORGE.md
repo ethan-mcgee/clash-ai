@@ -16,10 +16,10 @@ Build outputs (`build/`, `.gradle/`, the installed engine at `env/build/install/
 1. Edit the files under `third_party/crforge` and commit them with our other changes.
 2. Mark every changed file with a line near its top, as Apache-2.0 section 4(b) requires, e.g. `// Modified for clash-ai: <what and why>`.
 3. List the change in the table below.
-4. Rebuild what the change touches, from `third_party\crforge` (see [SETUP.md](SETUP.md) for `JAVA_HOME`):
-   - Java (`core`, `env`): `.\gradlew.bat --no-daemon :env:installDist`
-   - Tables: as in SETUP.md's build command
-   - Python (`python/crforge_env`): the venv holds an installed copy, so reinstall after each change, or install it once as editable: `pip install -e third_party\crforge\python`
+4. Nothing to rebuild by hand for the engine or its Python package:
+   - **Java** (`core`, `env` and the build files): `clashai` fingerprints these sources (their bytes, not file times) and, when they differ from the last build's, runs `gradlew :env:installDist` before starting the engine (`clashai.paths.ensure_engine`). Gradle compiles only what changed: about 30 s. `CLASHAI_NO_ENGINE_BUILD=1` turns this off.
+   - **Python** (`python/crforge_env`): installed editable in the venv (`pip install --no-deps -e third_party\crforge\python`), so edits take effect on the next import.
+   - **Tables** (`tables`): rebuild by hand with SETUP.md's build command.
 5. Run crforge's tests for the part changed, then ours (`pytest`).
 
 A change to the battle core breaks crforge's tick-exact match with the real game unless it fixes a mismatch. Keep the conformance tests passing.
