@@ -1,0 +1,52 @@
+# --- Game client and resources: never publish ---
+*.apk
+*.apks
+*.xapk
+*.obb
+user-provided/
+game-resources/
+*.so
+
+# --- Secrets and local config ---
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+
+# --- Data, caches, checkpoints, run outputs (keep these outside OneDrive) ---
+data/
+datasets/
+cache/
+caches/
+checkpoints/
+runs/
+outputs/
+wandb/
+*.parquet
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.npz
+*.h5
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+
+# --- Editors and OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
