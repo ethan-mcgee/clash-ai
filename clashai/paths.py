@@ -132,8 +132,8 @@ def ensure_java() -> Path:
 def default_threads() -> int:
     """JVM threads for stepping battles: one per physical core.
 
-    Battles stop speeding up past the physical cores (measured in docs/SETUP.md), so this halves
-    the logical count. Read from the machine, never fixed, so it grows when the BIOS re-enables
-    the 7900X's second core cluster (12 cores / 24 threads).
+    Hyperthreads add little until batches are large (docs/SETUP.md), and the Python and GPU side
+    needs CPU too, so this halves the logical count: 12 on the 7900X. Pass ``threads`` explicitly
+    to use all 24 for engine-only work such as replay conversion.
     """
     return max(1, (os.cpu_count() or 2) // 2)

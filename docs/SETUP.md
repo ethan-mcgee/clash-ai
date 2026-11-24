@@ -5,7 +5,7 @@ How this project's Windows 11 machine runs crforge and trains on it. crforge's o
 ## Hardware
 
 - GPU: RTX 3090 Ti, 24 GB, NVIDIA driver 621.14
-- CPU: Ryzen 9 7900X, 12 cores / 24 threads. **As of 2026-11-24 Windows sees only 6 cores / 12 threads**: one core cluster is disabled in the BIOS. The full 12 / 24 will be re-enabled soon; the throughput below was measured on 6 / 12 and will be re-measured then. Code sizes thread counts from the machine, never a hard-coded 12.
+- CPU: Ryzen 9 7900X, 12 cores / 24 threads, all enabled since 2026-11-24 (BIOS 4005; before that Windows saw 6 / 12). Code sizes thread counts from the machine, never a hard-coded number.
 - RAM: 64 GB
 - Disks: C: is nearly full, so everything large goes on **D:**
 
@@ -73,13 +73,16 @@ cd third_party\crforge\python
 
 - Throughput, `crforge-env-bench --engine ladder --decision-ticks 5` (random play, no neural network; one env step is one decision of one battle):
 
-| threads | 64 battles | 256 battles |
-|---:|---:|---:|
-| 1 | 11,308 steps/s | 12,164 steps/s |
-| 6 | 24,766 | 37,086 |
-| 12 | 25,624 | 40,492 |
+| threads | 64 battles | 256 battles | 512 battles |
+|---:|---:|---:|---:|
+| 1 | 11,308 steps/s | 12,164 steps/s | |
+| 6 | 21,802 | 39,449 | 42,783 |
+| 12 | 28,517 | 57,114 | 64,818 |
+| 24 | 30,458 | 63,217 | 83,169 |
 
-  At about 800 decisions a game, 40k steps/s is about 180,000 games an hour from the engine alone. Gains stop near 6 threads, which matches the 6 cores Windows sees.
+  Measured 2026-11-24 with all 12 cores / 24 threads enabled (the 1-thread row is from the earlier 6-core setup; runs vary by about 20%). At about 800 decisions a game, 83k steps/s is about 370,000 games an hour from the engine alone. Before the BIOS change, Windows saw 6 cores and gains stopped near 6 threads at about 40k steps/s. Hyperthreads now help at large batches (+28% from 12 to 24 threads at 512 battles), while `clashai` defaults to one thread per physical core (12) to leave room for the Python and GPU side.
+
+- GPU (2026-11-24): RTX 3090 Ti on PCIe 4.0 x16. 8192 x 8192 matmul at 76.6 TFLOPs in bf16 and 29.2 in fp32; 26.8 GB/s pinned host to GPU; 806 GB/s device copy; it holds the 450 W limit at about 60 C with clocks near 1.8 GHz.
 
 ## This project's package
 
