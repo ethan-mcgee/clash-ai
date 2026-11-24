@@ -25,7 +25,7 @@ Full plan and milestones: [docs/PLAN.md](docs/PLAN.md). Machine setup: [docs/SET
 | Milestone | State |
 |---|---|
 | M0. Foundations: environment, tests, evaluation harness, throughput | done |
-| M1. Data: audit, replay conversion, consistency filter | audit done ([docs/DATA.md](docs/DATA.md)); conversion next |
+| M1. Data: audit, replay conversion, consistency filter | done: 2,379 Piggies EQ battles, 4.5M rows ([docs/DATA.md](docs/DATA.md)) |
 | M2. Imitation: generalist, then specialist | not started |
 | M3. PPO league | not started |
 | M4. Search | not started |
