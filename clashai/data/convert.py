@@ -24,6 +24,7 @@ Each battle is written as a crforge replay document, which crforge's replay labe
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import time
@@ -428,21 +429,35 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=0, help="picks among fitting deck orders")
     parser.add_argument("--seed-variant", type=int, default=0, help="changes the battle seed")
     parser.add_argument("--tick-offset", type=int, default=0, help="added to every recorded tick")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip replays already in the summary and append to it")
+    parser.add_argument("--max-new", type=int, default=None,
+                        help="convert at most this many replays in this run (with --resume, in chunks)")
     args = parser.parse_args(argv)
 
-    from ..sim.env import make_vector
     from crforge_env import LadderConfig, VectorBattle
 
     out_dir = args.out or paths.data_root() / "converted" / f"{args.deck}-{args.mapping}-{args.sides}-v{args.seed_variant}-t{args.tick_offset}"
     out_dir.mkdir(parents=True, exist_ok=True)
     root = dataset_dir()
+    summary_path = out_dir / "summary.jsonl"
+    done_tags = set()
+    if args.resume and summary_path.exists():
+        done_tags = {json.loads(line)["tag"] for line in open(summary_path, encoding="utf-8")}
     replays = []
+    seen = 0
     for r in read_replays(root):
         if args.deck == "all" or any(is_deck(r, side, *PIGGIES) for side in ("team", "opponent")):
-            replays.append(r)
-            if args.limit and len(replays) >= args.limit:
+            seen += 1
+            if r.tag not in done_tags:
+                # Keep only the duration from the payload: the events come from the actions table.
+                replays.append(dataclasses.replace(r, payload={"replay": r.payload.get("replay", {})}))
+            if (args.limit and seen >= args.limit) or (args.max_new and len(replays) >= args.max_new):
                 break
-    print(f"{len(replays)} replays selected", flush=True)
+    print(f"{len(replays)} replays selected ({len(done_tags)} done before)", flush=True)
+    if not replays:
+        report(summary_path)
+        return
     events = load_events(root, {r.tag for r in replays})
     paths.ensure_java()
     vector = VectorBattle(min(args.batch, len(replays)), paths.default_threads(),
@@ -452,10 +467,9 @@ def main(argv: list[str] | None = None) -> None:
     names = CardNames(vector.vocabulary[i] for i in vector.card_types())
     table = SeedTable()
     rng = np.random.default_rng(args.seed)
-    summary_path = out_dir / "summary.jsonl"
     t0 = time.time()
     done = 0
-    with open(summary_path, "w", encoding="utf-8") as summary:
+    with open(summary_path, "a" if args.resume else "w", encoding="utf-8") as summary:
         pending: list[Plan] = []
 
         def flush():
