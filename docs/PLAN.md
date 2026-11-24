@@ -95,14 +95,14 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
 
 **1. Secure the game data first (time-sensitive)**
 - Install JDK 21 (`winget install EclipseAdoptium.Temurin.21.JDK`).
-- Add crforge as a pinned submodule at `third_party/crforge`.
+- Add crforge as a pinned submodule at `third_party/crforge` (since vendored with `git subtree`; see `docs/CRFORGE.md`).
 - Build its engine and the 16.635.8 tables: `gradlew :env:installDist :tables:dataVersionTables -Pcrforge.assetSource=cdn -Pcrforge.cache=D:\ml-data\clash-ai\crforge-cache`.
   - This downloads the game's data files from Supercell's asset server to your machine. They are never committed.
   - Supercell's server reportedly stops serving old data versions after an update, so this comes first, with a backup copy of the cache on D:.
 - If the build fails on native Windows, fall back to WSL2.
 
 **2. Python environment**
-- New Python 3.12 venv at `D:\ml-data\clash-ai\venv`: PyTorch 2.5.1 CUDA 12.4, `crforge-env` (from the submodule), `pyarrow`, `pytest`.
+- New Python 3.12 venv at `D:\ml-data\clash-ai\venv`: PyTorch 2.5.1 CUDA 12.4, `crforge-env` (from `third_party/crforge/python`), `pyarrow`, `pytest`.
 - Run crforge's own Python tests and benchmark.
 
 ## Milestones
@@ -139,7 +139,7 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
 ```
 clash-ai/
   pyproject.toml  NOTICE  README.md
-  third_party/crforge/          pinned submodule
+  third_party/crforge/          vendored crforge (git subtree)
   configs/piggies_eq.yaml
   clashai/
     sim/     env.py  adapter.py  mirror.py

@@ -28,6 +28,7 @@ wandb/
 *.ckpt
 *.safetensors
 *.onnx
+!third_party/crforge/**/*.onnx
 *.npz
 *.h5
 

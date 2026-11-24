@@ -7,7 +7,8 @@ This project depends on, and may adapt code from, the following projects:
 crforge
   https://github.com/voonhous/crforge
   Licensed under the Apache License, Version 2.0.
-  Included as a git submodule in third_party/crforge, unmodified.
+  Vendored in third_party/crforge from commit c56c196. Files changed for this
+  project are marked as such and listed in docs/CRFORGE.md.
   clashai/data/shuffle.py ports its BattleRandom, DeckShuffle and LadderMatch
   deal (core/src/main/java/org/crforge/core/battle/) to Python.
 
