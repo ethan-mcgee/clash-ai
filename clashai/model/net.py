@@ -53,7 +53,10 @@ def _onehot(x: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def _bits(x: torch.Tensor, n: int) -> torch.Tensor:
-    return ((x.long().unsqueeze(-1) >> torch.arange(n, device=x.device)) & 1).float()
+    """The low n bits of x, each 0 or 1. Arithmetic rather than shifts and masks, which ONNX does
+    not take on signed integers; equal to ``(x >> k) & 1`` for every integer x, negative too."""
+    powers = 2 ** torch.arange(n, device=x.device)
+    return torch.remainder(torch.div(x.long().unsqueeze(-1), powers, rounding_mode="floor"), 2).float()
 
 
 class Block(nn.Module):
@@ -149,7 +152,8 @@ class PolicyNet(nn.Module):
 
         slot_flags = header[:, self.spec.header["deck_slot"]].long()
         deck = self.card(self._ids(header, "deck")) + self.deck_in(torch.stack([
-            (slot_flags & 1).float(), ((slot_flags >> 1) & 1).float(),
+            torch.remainder(slot_flags, 2).float(),
+            torch.remainder(torch.div(slot_flags, 2, rounding_mode="floor"), 2).float(),
             (H("deck_evolution") + 1) / 3, H("deck_level") / 16], -1)) + typ[4]
 
         seen = self.card(self._ids(header, "enemy_seen")) + self.seen_in(torch.stack([
@@ -181,7 +185,7 @@ class PolicyNet(nn.Module):
         tokens = torch.cat([match, hand, nxt, queue, deck, seen, plays, pending,
                             ability, ents], 1)
         fixed = tokens.shape[1] - entities.shape[1]
-        pad = torch.cat([torch.zeros(len(header), fixed, dtype=torch.bool, device=header.device),
+        pad = torch.cat([torch.zeros(header.shape[0], fixed, dtype=torch.bool, device=header.device),
                          ~valid], 1)
         return self.norm_in(tokens), pad, fixed
 
@@ -223,7 +227,11 @@ class PolicyNet(nn.Module):
     def forward(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor) -> dict:
         """header (B, header_ints) int, entities (B, N, entity_ints) int, valid (B, N) bool."""
         tokens, pad, fixed = self._tokens(header, entities, valid)
-        out = self.norm_out(self.trunk(tokens, src_key_padding_mask=pad))
+        if torch.onnx.is_in_onnx_export():
+            trunk = self.trunk_explicit(tokens, pad)
+        else:
+            trunk = self.trunk(tokens, src_key_padding_mask=pad)
+        out = self.norm_out(trunk)
         match, hand, ability = out[:, 0], out[:, 1:5], out[:, fixed - 2:fixed]
         type_logits = torch.cat([self.wait_head(match), self.slot_head(hand).squeeze(-1),
                                  self.ability_head(ability).squeeze(-1)], 1)
@@ -236,15 +244,48 @@ class PolicyNet(nn.Module):
                 "match": match, "hand": hand, "entities": out[:, fixed:], "valid": valid,
                 "entity_tile": tile}
 
-    def tile_logits(self, out: dict, rows: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
-        """(len(rows), tiles) logits for a play of hand slot `slot` (0-based) in each given row."""
+    def trunk_explicit(self, x: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
+        """The trunk's pre-norm layers written out with the same weights, for ONNX export.
+
+        PyTorch's attention layer records the sequence length as a constant when traced; this
+        reshapes with -1 so the exported graph takes any number of units. Equal to ``self.trunk``
+        (tests/test_model.py).
+        """
+        b, heads = x.shape[0], self.config.heads
+        keep = (~pad)[:, None, None, :]  # True where a key may be attended to
+        for layer in self.trunk.layers:
+            attn = layer.self_attn
+            q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
+            q, k, v = (t.reshape(b, -1, heads, self.config.d // heads).transpose(1, 2)
+                       for t in (q, k, v))
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+            x = x + attn.out_proj(a.transpose(1, 2).reshape(b, -1, self.config.d))
+            x = x + layer.linear2(F.gelu(layer.linear1(layer.norm2(x))))
+        return x
+
+    def _grid(self, out: dict, rows: torch.Tensor) -> torch.Tensor:
+        """The entity outputs of the given rows scattered onto the tile grid, (rows, C, 32, 18)."""
         ents, valid = out["entities"][rows], out["valid"][rows]
         c = self.config.grid_channels
         v = self.grid_in(ents) * valid.unsqueeze(-1).to(ents.dtype)
-        grid = torch.zeros(len(rows), self.spec.tiles, c, device=v.device, dtype=v.dtype)
-        grid.scatter_add_(1, out["entity_tile"][rows].unsqueeze(-1).expand(-1, -1, c), v)
-        grid = grid.view(len(rows), self.spec.rows, self.spec.cols, c).permute(0, 3, 1, 2)
-        cond = torch.cat([out["hand"][rows, slot], out["match"][rows]], -1)
+        grid = torch.zeros(rows.shape[0], self.spec.tiles, c, device=v.device, dtype=v.dtype)
+        grid = grid.scatter_add(1, out["entity_tile"][rows].unsqueeze(-1).expand(-1, -1, c), v)
+        return grid.view(rows.shape[0], self.spec.rows, self.spec.cols, c).permute(0, 3, 1, 2)
+
+    def _tile_head(self, grid: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         gamma, beta = self.film(cond).chunk(2, -1)
         grid = (grid + self.grid_position) * (1 + gamma[..., None, None]) + beta[..., None, None]
         return self.grid_out(self.grid(grid)).flatten(1)
+
+    def tile_logits(self, out: dict, rows: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
+        """(len(rows), tiles) logits for a play of hand slot `slot` (0-based) in each given row."""
+        cond = torch.cat([out["hand"][rows, slot], out["match"][rows]], -1)
+        return self._tile_head(self._grid(out, rows), cond)
+
+    def tile_logits_all(self, out: dict) -> torch.Tensor:
+        """(B, hand slots, tiles) logits for a play of each hand slot in every row."""
+        b, slots = out["hand"].shape[0], self.spec.hand_slots
+        grid = self._grid(out, torch.arange(b, device=out["hand"].device))
+        grid = grid.unsqueeze(1).expand(-1, slots, -1, -1, -1).flatten(0, 1)
+        cond = torch.cat([out["hand"], out["match"].unsqueeze(1).expand(-1, slots, -1)], -1)
+        return self._tile_head(grid, cond.flatten(0, 1)).view(b, slots, -1)

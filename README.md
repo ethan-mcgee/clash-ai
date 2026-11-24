@@ -29,7 +29,7 @@ Full plan and milestones: [docs/PLAN.md](docs/PLAN.md). Machine setup: [docs/SET
 | M2. Imitation: generalist, then specialist | not started |
 | M3. PPO league | not started |
 | M4. Search | not started |
-| M5. Ablations, demo and write-up | not started |
+| M5. Ablations, demo and write-up | ONNX export done early (plays in crforge's visualizer; see [docs/SETUP.md](docs/SETUP.md)) |
 
 ## Scope and ground rules
 

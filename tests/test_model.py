@@ -125,3 +125,42 @@ def test_a_network_policy_plays_only_legal_actions_in_real_battles(data, tmp_pat
             v.step()
         assert plays > 0
         assert not v.infos[:, s.info["illegal_0"]].any() and not v.infos[:, s.info["illegal_1"]].any()
+
+
+def test_arithmetic_bits_equal_shifts_and_masks_for_every_integer():
+    from clashai.model.net import _bits
+
+    x = torch.arange(-5000, 5000)
+    want = torch.stack([((x >> k) & 1) for k in range(12)], -1).float()
+    assert torch.equal(_bits(x, 12), want)
+
+
+def test_the_all_slots_tile_head_equals_the_per_slot_one(data):
+    from clashai.train.bc import to_device
+
+    _, spec, b = data
+    torch.manual_seed(0)
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16)).eval()
+    batch = to_device(b, "cpu")
+    with torch.no_grad():
+        out = net(batch["header"], batch["entities"], batch["valid"])
+        every = net.tile_logits_all(out)
+        rows = torch.arange(len(b["actions"]))
+        for slot in range(spec.hand_slots):
+            one = net.tile_logits(out, rows, torch.full_like(rows, slot))
+            torch.testing.assert_close(every[:, slot], one, rtol=1e-5, atol=1e-5)
+
+
+def test_the_explicit_trunk_for_export_equals_the_trunk(data):
+    from clashai.train.bc import to_device
+
+    _, spec, b = data
+    torch.manual_seed(0)
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16)).eval()
+    batch = to_device(b, "cpu")
+    with torch.no_grad():
+        tokens, pad, _ = net._tokens(batch["header"], batch["entities"], batch["valid"])
+        want = net.trunk(tokens, src_key_padding_mask=pad)
+        got = net.trunk_explicit(tokens, pad)
+    live = ~pad  # padded tokens' outputs are never read
+    torch.testing.assert_close(got[live], want[live], rtol=1e-4, atol=1e-4)

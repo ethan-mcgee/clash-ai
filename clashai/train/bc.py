@@ -288,6 +288,7 @@ def main(argv: list[str] | None = None) -> None:
                       f"{m['value_mse']:.3f}, hand top4 {m['hand_top4_recall']:.3f}, next card "
                       f"{m['next_card_acc']:.3f} [{m['minutes']} min]", flush=True)
                 state = {"model": net.state_dict(), "description": net.describe(), "step": step,
+                         "metadata": rows.metadata,
                          "args": vars(args), "metrics": m}
                 torch.save(state, out / "last.pt")
                 if m["policy_nll"] < best:

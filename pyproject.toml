@@ -9,12 +9,15 @@ description = "A Clash Royale agent trained to play one deck (Piggies EQ) on the
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-# crforge-env comes from the pinned submodule: pip install third_party/crforge/python
+# crforge-env comes from the vendored crforge, editable: pip install -e third_party/crforge/python
 # PyTorch comes from the CUDA index: see docs/SETUP.md
 dependencies = ["numpy>=1.26", "pyyaml>=6", "pyarrow>=17"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# onnxruntime-gpu 1.24.4 is the newest build on the CUDA 12 libraries PyTorch 2.5.1 ships; newer
+# builds need CUDA 13 and fall back to the CPU here without saying so.
+export = ["onnx>=1.17", "onnxruntime-gpu==1.24.4"]
 
 [tool.setuptools.packages.find]
 include = ["clashai*"]

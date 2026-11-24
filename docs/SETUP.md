@@ -51,7 +51,7 @@ cd third_party\crforge
 C:\Python312\python.exe -m venv D:\ml-data\clash-ai\venv
 $py = "D:\ml-data\clash-ai\venv\Scripts\python.exe"
 & $py -m pip install "torch==2.5.1" --index-url https://download.pytorch.org/whl/cu124
-& $py -m pip install "third_party\crforge\python[dev]" pyarrow pyyaml
+& $py -m pip install -e "third_party\crforge\python[dev]" pyarrow pyyaml
 ```
 
 ## Running crforge from Python
@@ -87,7 +87,7 @@ cd third_party\crforge\python
 ## This project's package
 
 ```powershell
-& $py -m pip install -e ".[dev]"
+& $py -m pip install -e ".[dev,export]"
 & $py -m pytest -q --basetemp=D:/ml-data/clash-ai/tmp/pytest
 & $py -m clashai.eval.scorecard --policy scripted --opponent scripted --seeds 50
 ```
@@ -95,3 +95,20 @@ cd third_party\crforge\python
 - `clashai` sets `JAVA_HOME` to JDK 21 itself (`clashai/paths.py`), so no shell setup is needed. Every location can be overridden with `CLASHAI_DATA`, `CLASHAI_CRFORGE_INSTALL`, `CLASHAI_TABLES` and `CLASHAI_JAVA_HOME`.
 - Tests marked `engine` need the built engine and tables; without them they're skipped, not failed.
 - Scorecards are written to `D:\ml-data\clash-ai\runs\scorecards`.
+
+## Exporting a model and playing against it
+
+`python -m clashai.export.onnx --checkpoint <run>\best.pt --verify <rows folder> --bench` writes `D:\ml-data\clash-ai
+uns\onnx\<run>.onnx` in crforge's model format (export format 1; see `clashai/export/onnx.py`): inputs `observations` and `masks` exactly as the environment writes them, outputs `first_logp`, `tile_logp` and `value`, and metadata naming the schema, vocabulary, deck and levels. `--verify` compares ONNX Runtime with PyTorch on real rows; `--bench` times both. Checkpoints from before 2026-11-24 need `--metadata <rows folder>\metadata.json`.
+
+- ONNX Runtime must be `onnxruntime-gpu==1.24.4`. Newer builds are built for CUDA 13; with PyTorch's CUDA 12.4 libraries they fall back to the CPU silently. `clashai.export.onnx.session` refuses that fallback.
+- First export, the 600-step trial (2026-11-24): ONNX Runtime matched PyTorch to 4e-6 on the CPU and 5e-3 on the GPU over 512 real rows, with the same most likely choice on every row. crforge's `ModelOpponentTest` (6 tests) passed, playing a whole battle: 1,200 decisions, 76 plays, 0 refused, 18.6 ms a decision on the CPU with the battle.
+- Inference speed at batch 1,024 is about 4,300 observations a second through ONNX Runtime fp32 and 6,500 through PyTorch bf16. Half of that time is the tile head run for all four hand slots, which this format asks for. Self-play only needs the played slot's tiles (1.7 ms for 64 rows instead of 90 ms) and batches grouped by unit count (46 ms instead of 78), roughly 3 to 4 times faster.
+
+Play against it in crforge's visualizer, from `third_party\crforge` (`JAVA_HOME` set to JDK 21):
+
+```powershell
+.\gradlew.bat --no-daemon :desktop:run "-Pcrforge.dataVersion=16.635.8" "-Pcrforge.assetSource=cdn" "-Pcrforge.cache=D:/ml-data/clash-ai/crforge-cache" "--args=--model D:/ml-data/clash-ai/runs/onnx/<run>.onnx --model-sample"
+```
+
+`--model-sample` draws the model's moves from its probabilities. Without it the model takes its most likely move, which is nearly always a wait. A headless check of a model file: `.\gradlew.bat --no-daemon :desktop:test --tests "*ModelOpponentTest*" "-Pcrforge.modelFile=<file.onnx>"` with the same properties.
