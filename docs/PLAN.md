@@ -1,120 +1,175 @@
-# Clash Royale specialist agent: Piggies EQ on FirstLight_CR
+# Piggies EQ specialist on crforge, with our own training stack
 
 ## Context
 
-Goal: a project that trains one agent to play **one deck extremely well** on a single RTX 3090 Ti (24 GB), 64 GB RAM, Windows 11.
+Goal: train one agent to play **one deck, Piggies EQ, extremely well**, on one desktop: an RTX 3090 Ti, 64 GB RAM and a 12-thread CPU. Offline only; it never plays real people.
 
-Decisions so far:
-- **Deck:** Piggies EQ (Evo Royal Hogs, Archer Queen, Evo Cannon, Skeletons, Ice Spirit, The Log, Earthquake, Royal Delivery).
-- **Base:** build on FirstLight_CR, borrowing ideas from Daybreak. This replaces the earlier open-simulator plan.
+The first plan built on FirstLight_CR. That route is dead: Null's server now forces game version 16, and the content FirstLight needs can't be downloaded any more.
 
-## What the two repos actually give us
+Decision: **train on crforge only** (voonhous/crforge, Apache-2.0, Java 21). It is a separate simulator from RoyaleSim, and the more accurate one:
+- 20,763 of 20,763 recorded real battles match on every tick, on the current game data (16.635.8).
+- All 1,137 targeted test battles match, including Evo Royal Hogs, Evo Cannon and Archer Queen's ability.
+- About 127,000 steps a second per CPU thread.
 
-| | FirstLight_CR | Daybreak CR |
+The model, data pipeline, league and evaluation are written in this repo.
+
+Deck: Evo Royal Hogs, Archer Queen, Evo Cannon, Skeletons, Ice Spirit, The Log, Earthquake, Royal Delivery.
+
+## What crforge already gives us
+
+Read from its docs before any of it had run here; M0 verifies each item.
+
+| Need | crforge feature |
+|---|---|
+| Many battles at once | `VectorBattle(count, threads)`: battles step on JVM threads inside one Python process (via JPype); observations are numpy arrays that share memory with the engine |
+| Fair observations | Schema v4 shows a seat only what a player sees; `require_fair` rejects any model input that reads a hidden field |
+| Opponent elixir | Included in the observation "as a player counts it" |
+| Legal moves | A per-decision action mask; plays run 20 ticks after they're given, as in the game |
+| Levels and tower troops | `SideSetup` per side |
+| Search | `fork_from` copies a battle and re-deals the opponent's unseen cards from a belief we supply |
+| Baselines | `ScriptedBot` and `evaluate()` |
+| Demo | Its desktop visualizer can play a human against a model exported to ONNX |
+
+What it does **not** give us: it can't read our replay dataset directly. Its replay labeller needs the game's own replay files (with the random seed). Our data is RoyaleAPI's format: plays with card, coordinates and tick, but no seed and no opening hand. We write that conversion (M1).
+
+## Lessons carried over from the projects we studied
+
+| Lesson | Source | Where it lands |
 |---|---|---|
-| Licence | Apache-2.0, so we can fork it | None, so we can read it but not copy code |
-| Runnable from public files | Yes: engine build, replay cache, evaluation, play-against-it console all documented for Windows | No: needs a separate engine repo, a private dataset and a deck pool that aren't published |
-| Checkpoints | Ships General, IL, Active IL, and two Hog 2.6 specialists | None published |
-| Training scripts | bash/Slurm launchers written for an 8-GPU Linux cluster | Slurm, 3–4 A100s |
-| Best use for us | **The foundation** | **A design reference** |
+| Imitation first, then PPO anchored to the human policy | FirstLight, Daybreak, RoyaleFish, ClashAI | M2–M3 |
+| Specialists beat generalists | FirstLight 88%, RoyaleFish 66–68% | One fixed deck |
+| Drop replays the simulator can't reproduce | Daybreak | Consistency filter, M1 |
+| Paired seeds and confidence intervals | ClashAI | Evaluation harness, M0 |
+| Lookahead search, distilled back | itzik | M4 |
+| Train against the matchups you lose | RoyaleFish | League, M3 |
 
-In practice: build on FirstLight, and reimplement the Daybreak ideas worth having.
-
-Facts that shape the plan:
-- FirstLight's engine is the real game's battle code, run headless inside a MuMu Android 12 emulator through a patched Null's Royale 15.535.13 (arm64) APK. **You supply that APK yourself**; neither FirstLight nor this repo ships it. Treat it as untrusted: it stays inside the emulator, which the setup script cuts off from the network.
-- All eight Piggies EQ cards are in FirstLight's supported list. Evolution and Archer Queen ability bindings live in `form_evidence.json` and are not yet confirmed.
-- FirstLight's Hog 2.6 specialist started from the shipped General checkpoint and beat it 88% (760 games). We can start from the same checkpoint and skip the cluster-scale imitation stage.
-- The replay set (`VanguardX101/IL_Replay`, 252k replays) has plenty of Royal Hogs: 38,009 of the 91,970 replays indexed so far, with Earthquake in 7,814. Two of four sampled Royal Hogs replays were exactly this deck.
-- FirstLight's docs admit two weaknesses: specialists play passively in some openings, and a high win rate once came from exploiting a passive opponent.
-- Daybreak's live results came from queueing ranked ladder against real players. That is out of scope here: it breaks Supercell's terms and is unfair to the people on the other side. Everything in this plan is offline.
+| Failure seen elsewhere | Our guard |
+|---|---|
+| Scored against opponents from the training pool | Held-out decks and pilots, fixed before training |
+| Trained with a 1-tick card delay; 68% fell to 36% with the real one | crforge enforces the 20-tick delay; a test confirms it |
+| Dozens of hand-tuned reward bonuses | Win/loss plus potential-based tower shaping only |
+| Imitation from won games only | Lost games included, outcome-weighted; lane mirroring |
+| Opponent's hand ignored | Hand-belief head, used by the policy and by search |
+| Live ladder play | Offline only, stated in the README |
 
 ## Approach
 
-Warm-start from FirstLight's General checkpoint and fine-tune a Piggies EQ specialist with PPO, on one PC.
+### Environment
+- crforge's `VectorBattle`, decisions every 5 ticks (0.25 s), levels and tower troops per side.
+- Model input is crforge's v4 observation and mask, so the trained model can be exported to ONNX for the visualizer.
+- Action: crforge's own action integer (wait, play slot × tile, ability press), masked.
 
-Our own contributions:
+### Model
+- Entity transformer over the observation's rows, about 10–13M parameters, bf16 on the GPU. No recurrent state; recent plays are already in the observation.
+- Heads: action (card, then cell given the card), value.
+- Auxiliary heads: the opponent's unseen cards and next play. Targets come from crforge's hidden fields during training; the policy input never reads them.
 
-1. **A single-GPU training driver.** FirstLight only documents multi-node Slurm training. A one-box driver (one learner, engines in one MuMu VM) is the piece that makes this reproducible on a desktop, and it's a real engineering result on its own.
-2. **Human-anchored specialist training.** Add an imitation term on Piggies EQ human replays during PPO (Daybreak's recipe: coefficient 0.2, one imitation step per update) plus a KL penalty to the starting policy. This targets the passive-opening and opponent-exploitation failures FirstLight documents.
-3. **A matchup-weighted opponent field.** Opponent decks are sampled at the rate Piggies EQ actually faces them in the replay data, with extra weight on its worst matchups. Opponent pilots are the shipped IL and General checkpoints plus frozen past selves.
-4. **A per-matchup scorecard.** Win rate by opponent archetype, before and after, using FirstLight's own protocol (760 games per opponent, argmax, alternating sides) so the numbers are directly comparable to their Hog 2.6 results.
+### Data: RoyaleAPI replays into crforge
+- Dataset: `A1A2CV3/IL_Replay_1115`, 156,160 top-ladder replays from Nov 4–15, 2026. That is the 16.635.8 period crforge supports.
+- Our own Parquet parser (schema already mapped: decks, forms, levels, tower troops, plays with coordinates and 20 Hz tick, final tower HP).
+- **Opening-hand solver:** find a starting hand and draw order under which every recorded play was possible.
+- **Converter:** set up the battle, feed both sides' recorded plays at their ticks through the normal environment, and save (observation, mask, action) at every decision.
+- **Consistency filter:** compare final tower HP and crowns with the recorded result; keep samples up to the first refused play. The pass rate is reported.
+- Three things to settle by experiment in M1:
+  - how to force a chosen opening hand through crforge's Python API;
+  - whether RoyaleAPI's tick is when a play was sent or when it landed;
+  - how much the unknown random seed makes battles drift.
 
-### Compute
+### Training
+1. **Generalist by imitation** on a broad slice of the replays (start near 30k games). It pilots every opponent deck.
+2. **Specialist by imitation:** all Piggies EQ games, wins and losses, outcome-weighted, lanes mirrored.
+3. **PPO league:**
+   - Rewards: win/loss plus potential-based tower-HP shaping. Nothing deck-specific.
+   - KL penalty toward the imitation specialist.
+   - Opponent decks drawn at the rate Piggies EQ meets them in the replays, weighted toward its worst matchups.
+   - Pilots: the generalist, past versions picked by how often we lose to them, and one exploiter trained only to beat the specialist.
+   - Promotion only at 55% or better against the current champion on paired seeds.
+4. **Search:** fork the battle, deal the opponent's unseen cards from the belief head, roll out the top candidate plays, pick the best; distil into the network.
 
-- **GPU (CUDA, via PyTorch):** batched move selection for all concurrent matches, plus imitation and PPO gradient updates, with mixed precision. A 13M-parameter model leaves the 3090 Ti plenty of headroom.
-- **CPU:** the game engine runs inside the emulator on CPU cores. This, not the GPU, limits matches per hour.
-- **No Slurm.** Slurm is a cluster job scheduler that the upstream launchers assume. On one PC a plain launcher script replaces it.
+### Evaluation, built before any training
+- Held-out opponent decks and pilots, fixed in M0.
+- Paired seeds, alternating sides, Wilson 95% intervals, per-archetype scorecard.
+- Behaviour metrics against human Piggies EQ players: time to first play, elixir wasted at 10, ability presses per game, Earthquake targets.
 
-### Milestones
+## Setup
 
-**M0. Get FirstLight running**
-- Add FirstLight_CR as the pinned submodule. Python 3.12 venv, MuMu Player (Android 12, root, ARM64), JDK 17, Android NDK and build-tools.
-- Run `check_original_game.ps1`, `build_offline_engine.ps1`, `install_offline_engine.ps1`, then `launch_interface.cmd`.
-- Exit: a human plays a match against the shipped Hog 2.6 specialist in the console, and `evaluate` reproduces a slice of the published General vs IL result.
+**1. Secure the game data first (time-sensitive)**
+- Install JDK 21 (`winget install EclipseAdoptium.Temurin.21.JDK`).
+- Add crforge as a pinned submodule at `third_party/crforge`.
+- Build its engine and the 16.635.8 tables: `gradlew :env:installDist :tables:dataVersionTables -Pcrforge.assetSource=cdn -Pcrforge.cache=D:\ml-data\clash-ai\crforge-cache`.
+  - This downloads the game's data files from Supercell's asset server to your machine. They are never committed.
+  - Supercell's server reportedly stops serving old data versions after an update, so this comes first, with a backup copy of the cache on D:.
+- If the build fails on native Windows, fall back to WSL2.
 
-**M1. Measure and audit**
-- Throughput: games per hour at 1, 8, 24 engine processes, with CPU and RAM use. This sets the whole RL budget.
-- Read `battle_env.py`, the observation and action contracts, `form_evidence.json`; confirm Evo Royal Hogs, Evo Cannon and the Archer Queen ability work in a scripted match.
-- Download the replay set and audit it: exact Piggies EQ count by variant, win rate, opponent-deck frequencies.
-- Baseline: shipped General and IL checkpoints piloting Piggies EQ against the matchup-weighted field.
-- Exit: a throughput number, a variant table, a baseline scorecard. If the exact variant has under about 1,500 replays, include one-card-swap variants.
+**2. Python environment**
+- New Python 3.12 venv at `D:\ml-data\clash-ai\venv`: PyTorch 2.5.1 CUDA 12.4, `crforge-env` (from the submodule), `pyarrow`, `pytest`.
+- Run crforge's own Python tests and benchmark.
 
-**M2. Piggies EQ imitation data**
-- Build the replay cache for Piggies EQ replays only, with `cache_builder` and `--verify-roundtrip`.
-- Short imitation fine-tune of General on that cache as a sanity check.
-- Exit: held-out card and tile accuracy on Piggies EQ decisions, and a first scorecard versus the baseline.
+## Milestones
 
-**M3. Single-GPU PPO specialist**
-- Write the one-box driver around FirstLight's v4 trainer (`train_ppo_self_play_cluster.py`, env keys `CR_PPO_CHECKPOINT`, `CR_PPO_DECK_POOL`). Try native Windows first, since one GPU doesn't need the Linux-only multi-GPU backend; fall back to WSL2.
-- Fixed deck, matchup-weighted opponents, imitation term and KL penalty.
-- Rewards as in FirstLight's specialist 2: win/loss, tower-health shaping, elixir-overflow penalty. No deck-specific rewards.
-- Promote a new champion only at 55% or better against the current one (Daybreak's gate).
-- Exit: specialist beats General-on-Piggies-EQ with a confidence interval that clears 50%, and opening passivity is measured (time to first play).
+**M0. Foundations**
+- Package skeleton, environment wrapper, model-input adapter, evaluation harness, held-out deck split.
+- Tests: plays land 20 ticks after they're given; `require_fair` passes; same seeds give identical results; every unmasked action is accepted; mirroring round-trips.
+- A Piggies EQ smoke match: every card, both evolutions and the Archer Queen ability play without a "not modelled" refusal.
+- Throughput at 1, 6 and 12 threads. Check why Windows reports 12 threads on a 24-thread CPU.
+- Exit: tests pass; a games-per-hour number; a scripted-bot scorecard with intervals.
 
-**M4. Ablations and write-up**
-- Three runs with one idea removed each: no imitation term, uniform opponent decks, no KL penalty.
-- Scorecard, training curves, a recorded match from the console, and an honest limits section.
+**M1. Data**
+- Download and audit: Piggies EQ count by variant, win rate, opponent-deck frequencies.
+- Parser, opening-hand solver, converter, consistency filter.
+- Exit: the audit table, the consistency pass rate, a converted Piggies EQ set. If the exact deck has under about 1,500 games, add one-card-swap variants.
 
-**Optional experiments, after M4**
-- Bigger board encoder. Daybreak notes FirstLight's 12.7M-parameter net has only 0.29M in its board network. Distil the M3 specialist into a wider one, then continue PPO.
-- Opponent-deck prediction as an auxiliary head.
-- Move to FirstLight's `yes-delay` branch, which models the real game's 1-second deploy delay. Its checkpoints don't load on main, so this is a restart.
+**M2. Imitation**
+- Generalist, then specialist.
+- Exit: held-out card and cell accuracy reported (RoyaleFish's 63.5% and 31.5% as a rough yardstick); the specialist beats the generalist piloting Piggies EQ.
 
-### Layout
+**M3. PPO league**
+- Exit: on held-out decks and pilots, the PPO specialist beats the imitation specialist with an interval clear of 50%, and behaviour metrics stay near human ranges.
+
+**M4. Search**
+- Exit: measured win-rate gain and decision latency.
+
+**M5. Ablations, demo and write-up**
+- Remove one idea at a time: lost-game data, hand belief, matchup weighting, KL anchor, search.
+- Export to ONNX and play against the agent in crforge's visualizer.
+- Scorecard, curves, a recorded match, and a limits section.
+
+## Layout
 
 ```
-clash-ai/                      our public repo
-  third_party/FirstLight_CR/   upstream submodule, pinned; patches go in our fork of it
-  specialist/                  ours
-    audit/      replay download, deck and matchup tables
-    driver/     single-GPU PPO launcher, engine pool manager
-    train/      imitation term, KL penalty, opponent sampler, promotion gate
-    eval/       scorecard, passivity metric
-  docs/  tests/
+clash-ai/
+  pyproject.toml  NOTICE  README.md
+  third_party/crforge/          pinned submodule
+  configs/piggies_eq.yaml
+  clashai/
+    sim/     env.py  adapter.py  mirror.py
+    data/    download.py  replay.py  hand_solver.py  convert.py  audit.py  dataset.py
+    model/   net.py  heads.py
+    train/   bc.py  ppo.py  league.py
+    eval/    arena.py  stats.py  scorecard.py  behaviour.py
+    search/  lookahead.py
+    export/  onnx.py
+  tests/
+  docs/      PLAN.md  RESEARCH.md  SETUP.md
 ```
 
-Keep replay data, caches, checkpoints and run outputs **outside OneDrive** (this machine uses `D:\ml-data\clash-ai`; C: is nearly full) so multi-GB files don't sync.
-
-### Upstream pieces to reuse
-
-Paths are relative to `third_party/FirstLight_CR/`.
-
-- `native_runner/battle_env.py`: reset/step environment.
-- `native_runner/training/v4/`: `model.py`, `cache_builder.py`, `train_imitation_cache.py`, `train_ppo_self_play_cluster.py`, `evaluate.py`, `serve_policy.py`.
-- `checkpoints/General/checkpoint-step-00000460.pt` as the warm start; `checkpoints/IL/` and `checkpoints/2_6hog_expert/` as opponents and references.
-- `native_runner/data/competitive/card_support.json` and `form_evidence.json` for card and form ids.
+Data, the crforge cache, checkpoints and runs live under `D:\ml-data\clash-ai`, never in the repo.
 
 ## Risks
 
-- **Throughput is unknown.** FirstLight's General took roughly 156k games' worth of experience on 8 GPUs (460 updates of 1,528 matches × 40 game-seconds). If one PC manages about 96 concurrent matches at real-time speed, that same volume is about 3.5 days. That is an estimate, not a documented figure; M1 replaces it with a measurement. A specialist fine-tune should need far less.
-- **The training code targets a Linux cluster.** Adapting it to one Windows box may take real work. WSL2 is the fallback.
-- **Evolutions and the Archer Queen ability** may not be fully bound. If so, start with the non-evo deck.
-- **The game client is unofficial.** The APK is a modified copy of Supercell's game. This is offline research with no accounts involved, but the write-up should say plainly what it runs on.
-- **Small upstream.** FirstLight has one author and 12 commits. Pin the fork to a known commit.
+- **Unproven on this PC.** crforge's docs target macOS and Linux. JPype and Gradle both support Windows, but nobody has shown this stack running there. WSL2 is the fallback.
+- **Replay conversion is the hard part.** No project has published RoyaleAPI-to-crforge conversion. If the consistency pass rate is low, imitation data shrinks; the fallbacks are looser filtering and more self-play.
+- **Game data provenance.** crforge's tables are built from Supercell's files, and the replays come from RoyaleAPI. The write-up says so plainly; the repo ships neither.
+- **Game updates.** Supercell will move past 16.635.8. We pin crforge's commit and keep our cached tables, so the project stays reproducible on the November data.
+- **Piggies EQ sample size** is unknown until the audit.
+- **Throughput** is likely limited by GPU inference, not the engine. The estimate is tens of thousands of games an hour; M0 measures it.
+- **Scope.** M0–M3 are the project. M4 and M5's demo can be cut without losing a complete result.
 
 ## Verification
 
-- M0: console launches; `python -m native_runner.training.v4.evaluate --checkpoint-a ... --checkpoint-b ... --games N --output DIR` writes `summary.json` with a win rate near the published one.
-- M1: throughput script output; audit table spot-checked against the dataset viewer.
-- M2: cache round-trip verification passes; held-out accuracy logged.
-- M3–M4: 760-game evaluations per opponent with fixed seeds and alternating sides; every claimed gain is an A/B on the same seeds; unit tests for the opponent sampler, promotion gate and loss terms.
+- `pytest` green on every commit, including the delay, fairness, determinism and mask tests.
+- First steps: crforge's own test suite and benchmark pass; the tables' data version reads 16.635.8.
+- M0: the arena gives identical results from the same seeds.
+- M1: audit counts spot-checked against the Hugging Face viewer; one replay hand-checked play by play.
+- M2: validation split grouped by `replay_tag`, so both sides of a battle stay together.
+- M3–M5: every claimed gain is a paired-seed comparison of at least 400 games with a 95% interval, on held-out decks and pilots only.

@@ -1,57 +1,82 @@
 # Machine setup
 
-How this project's Windows machine was set up for FirstLight_CR. FirstLight's own guide is [third_party/FirstLight_CR/docs/getting_started.md](../third_party/FirstLight_CR/docs/getting_started.md); this file records the choices and fixes specific to this setup.
+How this project's Windows 11 machine runs crforge and trains on it. crforge's own docs are in [third_party/crforge/docs](../third_party/crforge/docs); this file records the choices, commands and fixes specific to this setup.
 
 ## Hardware
 
 - GPU: RTX 3090 Ti, 24 GB, NVIDIA driver 621.14
-- CPU: Ryzen 9 7900X (Windows reports 12 logical processors)
+- CPU: Ryzen 9 7900X. **Windows sees 6 cores / 12 threads, not 12 / 24**: one core cluster appears to be disabled in the BIOS. Throughput below is measured as-is.
 - RAM: 64 GB
 - Disks: C: is nearly full, so everything large goes on **D:**
 
 ## Layout
 
-| What | Where | Why |
-|---|---|---|
-| This repo | OneDrive Desktop | Small; synced |
-| FirstLight_CR | `third_party/FirstLight_CR`, git submodule pinned to `4c82496` | Apache-2.0 upstream, ~250 MB including shipped checkpoints |
-| Python venv | `D:\ml-data\clash-ai\venv-firstlight` | Keeps multi-GB PyTorch out of OneDrive and off C: |
-| Replay dataset | `D:\ml-data\clash-ai\datasets\royaleapi` | Same |
-| FirstLight `.env` | `third_party/FirstLight_CR/.env` | Machine-specific; ignored by FirstLight's `.gitignore` |
+| What | Where |
+|---|---|
+| This repo | OneDrive Desktop (small, synced) |
+| crforge | `third_party/crforge`, git submodule pinned to `c56c196` (2026-11-22) |
+| Python venv | `D:\ml-data\clash-ai\venv` |
+| Gradle home | `D:\ml-data\clash-ai\gradle-home` (about 220 MB of build tools) |
+| Game data cache and tables | `D:\ml-data\clash-ai\crforge-cache` (`tables\16.635.8`) |
+| Cache backup | `D:\ml-data\clash-ai\backups\crforge-cache-16.635.8-2026-11-24.zip` |
+| Datasets, checkpoints, runs | `D:\ml-data\clash-ai\{datasets,checkpoints,runs}` |
+
+None of the D: folders are in the repo.
 
 ## Tools
 
 | Tool | Version | Notes |
 |---|---|---|
-| Python | 3.12.6 (with Tkinter) | FirstLight targets 3.12 |
-| PyTorch | 2.5.1, CUDA 12.4 build | Installed from `https://download.pytorch.org/whl/cu124`; the PyPI wheel on Windows is CPU-only |
-| JDK | Temurin 17.0.21.1 | `winget install --id EclipseAdoptium.Temurin.17.JDK -e`. Another Java is first on PATH, so `.env` points at JDK 17 explicitly |
-| Android SDK | `C:\Android\Sdk` | platform-tools 37.0.3, build-tools 37.0.0, NDK 27.3.13750724 (r27d) |
-| MuMu Player | 6.8.15.0 | Instance 0, Android 12, root on, ARM64 via native bridge |
+| Python | 3.12.6 | `C:\Python312` |
+| PyTorch | 2.5.1, CUDA 12.4 build | From `https://download.pytorch.org/whl/cu124`; the PyPI wheel on Windows is CPU-only |
+| JDK | Temurin 21.0.13.1 | `winget install --id EclipseAdoptium.Temurin.21.JDK -e`. Your user-level `JAVA_HOME` points at Java 25, so set `JAVA_HOME` to JDK 21 in every shell that runs crforge (below) |
+| crforge-env | 0.1.0 (from the submodule) | JPype 1.7.1, NumPy 2.5.5 |
 
-### Android SDK gotcha
-
-`sdkmanager.bat` is deprecated, and Windows batch files split arguments on `;`, so `sdkmanager "build-tools;37.0.0"` silently installs nothing and still exits 0. Use the replacement CLI with `/`:
+## Build crforge and its game tables
 
 ```powershell
-$env:JAVA_HOME = "<JDK 17 folder>"
-C:\Android\Sdk\cmdline-tools\latest\bin\android.exe --sdk=C:\Android\Sdk sdk install platform-tools build-tools/37.0.0 ndk/27.3.13750724
+$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-21.0.13.10002-hotspot"
+$env:GRADLE_USER_HOME = "D:\ml-data\clash-ai\gradle-home"
+cd third_party\crforge
+.\gradlew.bat --no-daemon :env:installDist :tables:dataVersionTables "-Pcrforge.assetSource=cdn" "-Pcrforge.cache=D:/ml-data/clash-ai/crforge-cache"
 ```
 
-### Use one adb
+- Builds natively on Windows in about 2.5 minutes; no WSL needed.
+- `-Pcrforge.assetSource=cdn` downloads about 13 MB of the game's data files from Supercell's asset server, for client 16.635.13 / data version 16.635.8, and decodes them into 30 JSON tables. They stay on D: and are never committed.
+- The asset server may stop serving this version after a game update, so the cache is backed up (zip SHA-256 `d4afae817da0439a628b74d9c5be66a717ef049dc8052112bc4686414f6a7714`). To restore, unzip it into `D:\ml-data\clash-ai\crforge-cache`.
 
-MuMu ships its own `adb.exe`. Use the SDK's (`C:\Android\Sdk\platform-tools\adb.exe`) everywhere; two adb versions keep killing each other's server.
+## Python environment
 
-## `.env` keys filled
+```powershell
+C:\Python312\python.exe -m venv D:\ml-data\clash-ai\venv
+$py = "D:\ml-data\clash-ai\venv\Scripts\python.exe"
+& $py -m pip install "torch==2.5.1" --index-url https://download.pytorch.org/whl/cu124
+& $py -m pip install "third_party\crforge\python[dev]" pyarrow pyyaml
+```
 
-`CR_PYTHON`, `CR_PYTHONW`, `CR_REPLAY_DATASET_ROOT`, `CR_MUMU_MANAGER`, `CR_ADB`, `CR_VM_INDEX`, `CR_VM_NAME`, `CR_ADB_SERIAL`, `CR_JAVA`, `CR_KEYTOOL`, `CR_BUILD_TOOLS`, `CR_NDK_ROOT`. Everything else is left blank, as FirstLight's guide says.
+## Running crforge from Python
 
-## Game client
+- crforge starts Java through JPype, which reads `JAVA_HOME`. Set it to JDK 21 first.
+- Every entry point takes the installed engine folder, `third_party\crforge\env\build\install\env`, and the tables folder.
+- On Windows, the JVM triggers access violations on purpose during start-up and handles them itself. Python's fault handler (on in pytest) prints them as "Windows fatal exception: access violation" with a stack dump. They're harmless; `-p no:faulthandler` silences them.
+- pytest can't use the system temp folder on this machine: pass `-p no:cacheprovider --basetemp=D:/ml-data/clash-ai/tmp/pytest`.
 
-FirstLight needs the Null's Royale 15.535.13 arm64-v8a APK, supplied by the user at `third_party/FirstLight_CR/user-provided/nulls-royale.apk`. It is never committed: both repos' `.gitignore` files block `*.apk` and `user-provided/`.
+## Verified (2026-11-24)
 
-## Verified
+- `torch.cuda.is_available()` is true on the 3090 Ti.
+- crforge's Python suite, with the real 16.635.8 tables: **283 passed**.
 
-- `torch.cuda.is_available()` is true; a 4096×4096 matmul runs on the 3090 Ti.
-- All five shipped checkpoints match the SHA-256 and sizes in `checkpoints/manifest.json`, and load with `weights_only=True` (plain tensors, no pickled code).
-- FirstLight's `load_policy_v4` builds the General, IL and Hog 2.6 specialist 2 policies on CUDA: 12.05M parameters each, about 52 MB of VRAM for all three.
+```powershell
+cd third_party\crforge\python
+& $py -m pytest -q -p no:cacheprovider -p no:faulthandler --basetemp=D:/ml-data/clash-ai/tmp/pytest-crforge "--install=..\env\build\install\env" "--tables=D:\ml-data\clash-ai\crforge-cache\tables\16.635.8"
+```
+
+- Throughput, `crforge-env-bench --engine ladder --decision-ticks 5` (random play, no neural network; one env step is one decision of one battle):
+
+| threads | 64 battles | 256 battles |
+|---:|---:|---:|
+| 1 | 11,308 steps/s | 12,164 steps/s |
+| 6 | 24,766 | 37,086 |
+| 12 | 25,624 | 40,492 |
+
+  At about 800 decisions a game, 40k steps/s is about 180,000 games an hour from the engine alone. Gains stop near 6 threads, which matches the 6 cores Windows sees.

@@ -1,4 +1,3 @@
-[submodule "third_party/FirstLight_CR"]
-	path = third_party/FirstLight_CR
-	url = https://github.com/ethan-mcgee/FirstLight_CR.git
-	branch = clash-ai
+[submodule "third_party/crforge"]
+	path = third_party/crforge
+	url = https://github.com/voonhous/crforge.git

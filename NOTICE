@@ -1,0 +1,18 @@
+clash-ai
+Copyright (c) 2026 Ethan McGee
+Licensed under the MIT License (see LICENSE).
+
+This project depends on, and may adapt code from, the following projects:
+
+crforge
+  https://github.com/voonhous/crforge
+  Licensed under the Apache License, Version 2.0.
+  Included as a git submodule in third_party/crforge, unmodified.
+
+Code adapted from Apache-2.0 projects is marked at the adapted function or
+module with the source file and commit.
+
+No game binaries, game data tables, replays or other Supercell content are
+included in this repository. crforge builds its game tables locally from the
+game's own files; those files remain subject to Supercell's rights. This
+project is not affiliated with, endorsed by, or representative of Supercell.
