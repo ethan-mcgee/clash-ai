@@ -14,7 +14,7 @@ How this project's Windows 11 machine runs crforge and trains on it. crforge's o
 | What | Where |
 |---|---|
 | This repo | OneDrive Desktop (small, synced) |
-| crforge | `third_party/crforge`, git submodule pinned to `c56c196` (2026-11-22) |
+| crforge | `third_party/crforge`, vendored with `git subtree` from `c56c196` (2026-11-22); see [CRFORGE.md](CRFORGE.md) |
 | Python venv | `D:\ml-data\clash-ai\venv` |
 | Gradle home | `D:\ml-data\clash-ai\gradle-home` (about 220 MB of build tools) |
 | Game data cache and tables | `D:\ml-data\clash-ai\crforge-cache` (`tables\16.635.8`) |
@@ -30,7 +30,7 @@ None of the D: folders are in the repo.
 | Python | 3.12.6 | `C:\Python312` |
 | PyTorch | 2.5.1, CUDA 12.4 build | From `https://download.pytorch.org/whl/cu124`; the PyPI wheel on Windows is CPU-only |
 | JDK | Temurin 21.0.13.1 | `winget install --id EclipseAdoptium.Temurin.21.JDK -e`. Your user-level `JAVA_HOME` points at Java 25, so set `JAVA_HOME` to JDK 21 in every shell that runs crforge (below) |
-| crforge-env | 0.1.0 (from the submodule) | JPype 1.7.1, NumPy 2.5.5 |
+| crforge-env | 0.1.0, editable from `third_party/crforge/python` | JPype 1.7.1, NumPy 2.5.5 |
 
 ## Build crforge and its game tables
 

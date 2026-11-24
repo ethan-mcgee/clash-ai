@@ -4,14 +4,18 @@ Every location can be overridden with an environment variable, so nothing machin
 hard-coded beyond the defaults:
 
 - ``CLASHAI_DATA``: the data root (datasets, checkpoints, runs, the crforge cache)
-- ``CLASHAI_CRFORGE_INSTALL``: crforge's installed env distribution
+- ``CLASHAI_CRFORGE_INSTALL``: crforge's installed env distribution (when set, used as is and
+  never rebuilt)
+- ``CLASHAI_NO_ENGINE_BUILD``: set to 1 to never rebuild the engine automatically
 - ``CLASHAI_TABLES``: the game tables folder of :data:`DATA_VERSION`
 - ``CLASHAI_JAVA_HOME``: the JDK (21) that runs crforge
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -29,8 +33,63 @@ def runs_dir() -> Path:
 
 
 def install_dir() -> Path:
-    default = CRFORGE / "env" / "build" / "install" / "env"
-    return Path(os.environ.get("CLASHAI_CRFORGE_INSTALL", default))
+    """crforge's installed engine, rebuilt first if its Java sources changed (see ensure_engine)."""
+    if os.environ.get("CLASHAI_CRFORGE_INSTALL"):
+        return Path(os.environ["CLASHAI_CRFORGE_INSTALL"])
+    ensure_engine()
+    return CRFORGE / "env" / "build" / "install" / "env"
+
+
+# What the engine install is built from: the env module, the core it depends on, and the build files.
+ENGINE_SOURCES = ("core/src/main", "env/src/main", "core/build.gradle.kts", "env/build.gradle.kts",
+                  "build.gradle.kts", "settings.gradle.kts", "gradle.properties",
+                  "gradle/libs.versions.toml")
+_MARKER = ".clashai-sources"
+_checked = False
+
+
+def engine_sources_hash(root: Path = CRFORGE) -> str:
+    """A hash of every engine source file's path and bytes (not times, so a checkout that only
+    touches files does not count as a change)."""
+    h = hashlib.sha256()
+    for entry in ENGINE_SOURCES:
+        p = root / entry
+        files = sorted(f for f in p.rglob("*") if f.is_file()) if p.is_dir() else [p]
+        for f in files:
+            if f.is_file():
+                h.update(f.relative_to(root).as_posix().encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def ensure_engine(force: bool = False) -> None:
+    """Rebuilds crforge's engine (``gradlew :env:installDist``) when its Java sources differ from
+    the last build's: the Java side's equivalent of an editable install. Checked once a process.
+
+    Gradle compiles only what changed. The build uses the JDK of :func:`ensure_java` and the Gradle
+    home on the data drive, offline (its dependencies are cached by the first build).
+    """
+    global _checked
+    if (_checked and not force) or os.environ.get("CLASHAI_NO_ENGINE_BUILD") == "1":
+        return
+    install = CRFORGE / "env" / "build" / "install" / "env"
+    marker = install / _MARKER
+    digest = engine_sources_hash()
+    if not force and install.is_dir() and marker.is_file() and marker.read_text().strip() == digest:
+        _checked = True
+        return
+    java = ensure_java()
+    env = dict(os.environ, JAVA_HOME=str(java),
+               GRADLE_USER_HOME=os.environ.get("GRADLE_USER_HOME",
+                                               str(data_root() / "gradle-home")))
+    gradlew = CRFORGE / ("gradlew.bat" if os.name == "nt" else "gradlew")
+    print("crforge's Java sources changed since the engine was built: rebuilding "
+          "(gradlew :env:installDist)", flush=True)
+    done = subprocess.run([str(gradlew), "--no-daemon", "--offline", "-q", ":env:installDist"],
+                          cwd=CRFORGE, env=env, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"crforge's engine build failed:\n{done.stdout[-4000:]}\n{done.stderr[-4000:]}")
+    marker.write_text(digest + "\n")
+    _checked = True
 
 
 def tables_dir() -> Path:
