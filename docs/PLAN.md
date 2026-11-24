@@ -93,7 +93,7 @@ clash-ai/                      our public repo
   docs/  tests/
 ```
 
-Keep replay data, caches, checkpoints and run outputs **outside OneDrive** (for example `C:\ml-data\clash-ai`) so multi-GB files don't sync.
+Keep replay data, caches, checkpoints and run outputs **outside OneDrive** (this machine uses `D:\ml-data\clash-ai`; C: is nearly full) so multi-GB files don't sync.
 
 ### Upstream pieces to reuse
 
