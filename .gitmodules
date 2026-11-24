@@ -1,3 +1,4 @@
 [submodule "third_party/FirstLight_CR"]
 	path = third_party/FirstLight_CR
-	url = https://github.com/Jaasssoooonnnnn/FirstLight_CR.git
+	url = https://github.com/ethan-mcgee/FirstLight_CR.git
+	branch = clash-ai
