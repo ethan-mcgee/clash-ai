@@ -1,0 +1,7 @@
+{
+ "schema": "crforge.native-battle-smoke.v1",
+ "ticks": 600,
+ "observations": 601,
+ "trace_sha256": "fe0cd8726a9af8b9a99e5d7a6c46d127f5aa57655006f3bfc972318dd60b3b65",
+ "scenario_sha256": "8e0c2b683c7e4137bdf08f7eb38bd9755aa616fb758d49b518412af74dfe5764"
+}
