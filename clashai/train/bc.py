@@ -32,6 +32,7 @@ import torch.nn.functional as F
 
 from .. import paths
 from ..model.net import Config, PolicyNet
+from ..model.policy import load_net
 from ..model.spec import Spec, unpack_masks
 from .rows import Rows
 
@@ -201,13 +202,6 @@ def evaluate(net, rows: Rows, indices: np.ndarray, *, policy_rows: str, loss_wei
     }
 
 
-def load(path: Path, device="cpu") -> tuple[PolicyNet, dict]:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    net = PolicyNet.from_description(ckpt["description"]).to(device)
-    net.load_state_dict(ckpt["model"])
-    return net, ckpt
-
-
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Imitation training")
     p.add_argument("--name", required=True)
@@ -231,6 +225,9 @@ def main(argv: list[str] | None = None) -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
+    # Past this share PyTorch frees its cache instead of growing: on Windows the driver would
+    # otherwise spill GPU memory into system RAM and slow training about tenfold.
+    torch.cuda.set_per_process_memory_fraction(0.8)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     t0 = time.time()
@@ -238,7 +235,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"loaded {rows.n:,} rows in {time.time() - t0:.0f} s", flush=True)
     spec = Spec.from_metadata(rows.metadata)
     if args.init:
-        net, init = load(Path(args.init), device)
+        net, _ = load_net(Path(args.init), device)
+        net.train()
         assert net.spec.to_dict() == spec.to_dict(), "the rows' layout differs from the checkpoint's"
     else:
         net = PolicyNet(spec, Config(d=args.d, layers=args.layers, heads=args.heads)).to(device)

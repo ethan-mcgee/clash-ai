@@ -95,3 +95,33 @@ def test_the_network_runs_and_learns_a_batch(data):
         opt.step()
         first = first or s["policy"]
     assert s["policy"] < 0.7 * first
+
+
+@pytest.mark.engine
+def test_a_network_policy_plays_only_legal_actions_in_real_battles(data, tmp_path):
+    from clashai.decks import PIGGIES_EQ
+    from clashai.model.policy import NetPolicy
+    from clashai.sim.env import make_vector
+
+    _, spec, _ = data
+    torch.manual_seed(0)
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16))
+    path = tmp_path / "tiny.pt"
+    torch.save({"model": net.state_dict(), "description": net.describe(), "step": 0}, path)
+    policy = NetPolicy(path, device="cuda" if torch.cuda.is_available() else "cpu")
+    with make_vector(4, 2) as v:
+        s = v.schema
+        policy.bind(v)
+        slots = PIGGIES_EQ.slots(s.slot_evolution)
+        v.reset([1, 2, 3, 4], list(PIGGIES_EQ.cards), list(PIGGIES_EQ.cards), slots, slots)
+        rng = np.random.default_rng(0)
+        plays = 0
+        for _ in range(400):
+            obs, masks = v.observations.reshape(8, -1), v.masks.reshape(8, -1)
+            a = policy.act(obs, masks, rng)
+            assert masks[np.arange(8), a].all()
+            plays += int((a != 0).sum())
+            v.actions[:] = a.reshape(4, 2)
+            v.step()
+        assert plays > 0
+        assert not v.infos[:, s.info["illegal_0"]].any() and not v.infos[:, s.info["illegal_1"]].any()

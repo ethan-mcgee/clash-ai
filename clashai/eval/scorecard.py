@@ -20,10 +20,22 @@ from .arena import Side, play
 from .stats import summarize
 
 
+def make_policy(name: str, temperature: float = 1.0):
+    if name in BASELINES:
+        return BASELINES[name]()
+    if name.endswith(".pt"):
+        from ..model.policy import NetPolicy
+
+        return NetPolicy(name, temperature=temperature)
+    raise SystemExit(f"unknown policy {name!r}: one of {sorted(BASELINES)} or a .pt checkpoint")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--policy", choices=BASELINES, default="random")
-    parser.add_argument("--opponent", choices=BASELINES, default="scripted")
+    parser.add_argument("--policy", default="random",
+                        help=f"one of {sorted(BASELINES)} or a checkpoint (.pt) path")
+    parser.add_argument("--opponent", default="scripted", help="as --policy")
+    parser.add_argument("--temperature", type=float, default=1.0, help="for checkpoint policies")
     parser.add_argument("--seeds", type=int, default=50, help="seeds per deck; 2 games each")
     parser.add_argument("--first-seed", type=int, default=1_000_000)
     parser.add_argument("--decks", nargs="*", default=list(REFERENCE_DECKS))
@@ -32,7 +44,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     seeds = list(range(args.first_seed, args.first_seed + args.seeds))
-    policy, opponent = BASELINES[args.policy](), BASELINES[args.opponent]()
+    policy = make_policy(args.policy, args.temperature)
+    opponent = make_policy(args.opponent, args.temperature)
     rows, record, every = [], {}, []
     t0 = time.time()
     for name in args.decks:
@@ -48,7 +61,7 @@ def main(argv: list[str] | None = None) -> None:
     total = summarize(g.score for g in every)
     faults = sum(1 for g in every if g.fault != "none")
     print()
-    print(f"Piggies EQ ({args.policy}) vs reference decks ({args.opponent}), {args.seeds} seeds "
+    print(f"Piggies EQ ({policy.name}) vs reference decks ({opponent.name}), {args.seeds} seeds "
           "x 2 seats per deck")
     print()
     print("| deck | archetype | held out | games | W-D-L | score | 95% interval |")
@@ -59,7 +72,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"{len(every)} games in {elapsed:.0f} s ({len(every) / elapsed * 3600:,.0f} games/hour), "
           f"{faults} faulted")
     out = paths.runs_dir() / "scorecards" if args.out is None else None
-    path = (out / f"{time.strftime('%Y%m%d-%H%M%S')}-{args.policy}-vs-{args.opponent}.json"
+    path = (out / f"{time.strftime('%Y%m%d-%H%M%S')}-{policy.name}-vs-{opponent.name}.json"
             if out else args.out)
     if out:
         out.mkdir(parents=True, exist_ok=True)

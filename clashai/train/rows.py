@@ -163,7 +163,9 @@ class Rows:
         """A batch: arrays for rows ``idx``, entities padded to the batch's longest row."""
         starts = self.entity_offsets[idx]
         counts = np.minimum(self.entity_offsets[idx + 1] - starts, max_entities)
-        width = max(1, int(counts.max()))
+        # Widths rounded up to a multiple of 16, so the GPU sees few distinct shapes and its memory
+        # cache stays small.
+        width = min(max(16, -(-int(counts.max()) // 16) * 16), max(max_entities, 1))
         valid = np.arange(width)[None, :] < counts[:, None]
         ents = np.zeros((len(idx), width, self.entities.shape[1]), np.int32)
         ents[valid] = self.entities[(starts[:, None] + np.arange(width)[None, :])[valid]]
