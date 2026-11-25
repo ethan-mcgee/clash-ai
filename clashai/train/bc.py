@@ -19,11 +19,23 @@ Losses, per row weighted by its wait-sampling weight:
 Rows are mirrored left to right with probability ``--mirror``. Validation is on held-out battles.
 The trunk trains with ``--dropout``. A run stops early once ``--patience`` validations in a row
 fail to improve the policy loss; ``best.pt`` is the checkpoint with the lowest one.
+
+``--ema`` keeps an exponential moving average of the weights, which is what is validated and
+saved (``last.pt`` also keeps the raw weights). ``--profile N`` runs N steps under the PyTorch
+profiler, writes ``profile.json`` (open it at ui.perfetto.dev) and stops. The progress lines show
+the share of time spent waiting for batches: above a few percent, the data loader limits speed.
+
+``--value-only`` fits a fresh value head on the frozen network of ``--init`` and nothing else,
+stopping on the validation value error:
+
+    python -m clashai.train.bc --name generalist-value --rows <rows> --init <ckpt> --value-only \\
+        --steps 10000 --eval-every 500
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import queue
@@ -86,10 +98,26 @@ def to_device(b: dict, device) -> dict:
     return {k: torch.from_numpy(np.ascontiguousarray(v)).to(device) for k, v in b.items()}
 
 
-def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: float,
-                   mirror: float = 0.0, value_weight: float = 0.1,
-                   metrics: bool = False) -> tuple[torch.Tensor, dict]:
-    spec = net.spec
+class EMA:
+    """An exponential moving average of a network's weights. The decay ramps up from about 0.1
+    over the first steps, so the average is not dominated by the starting weights."""
+
+    def __init__(self, net: PolicyNet, decay: float):
+        self.net, self.decay = copy.deepcopy(net).eval(), decay
+        for p in self.net.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, net: PolicyNet, step: int) -> None:
+        d = min(self.decay, (1 + step) / (10 + step))
+        torch._foreach_lerp_(list(self.net.parameters()), list(net.parameters()), 1 - d)
+
+
+MINUTE = 1200  # ticks
+PHASES = 4  # the value's sign accuracy is reported for minutes 1, 2, 3 and overtime
+
+
+def _mirrored(spec, b: dict, mirror: float) -> tuple:
     header, entities, valid = b["header"], b["entities"], b["valid"]
     mask = unpack_masks(b["masks"], spec.actions)
     actions = b["actions"].long()
@@ -100,6 +128,26 @@ def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: fl
         entities = torch.where(flip[:, None, None], me, entities)
         mask = torch.where(flip[:, None], mm, mask)
         actions = torch.where(flip, ma, actions)
+    return header, entities, valid, mask, actions
+
+
+def value_loss(net: PolicyNet, b: dict, *, mirror: float, dropout: float) -> tuple[torch.Tensor, dict]:
+    """The value head's weighted squared error on a frozen network, its input under dropout."""
+    header, entities, valid, _, _ = _mirrored(net.spec, b, mirror)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=header.is_cuda):
+        match = net(header, entities, valid)["match"]
+    x = F.dropout(match.float(), dropout, training=True)
+    pred = torch.tanh(net.value_head(x).squeeze(-1))
+    weight = b["weight"].float()
+    loss = (weight * (pred - b["result"].float()) ** 2).sum() / weight.sum()
+    return loss, {"loss": loss.item(), "value": loss.item()}
+
+
+def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: float,
+                   mirror: float = 0.0, value_weight: float = 0.1,
+                   metrics: bool = False) -> tuple[torch.Tensor, dict]:
+    spec = net.spec
+    header, entities, valid, mask, actions = _mirrored(spec, b, mirror)
 
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=header.is_cuda):
         out = net(header, entities, valid)
@@ -145,14 +193,23 @@ def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: fl
              "belief_hand": belief_hand.item(), "belief_next": belief_next.item()}
     if metrics:
         stats["sums"] = (_metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w,
-                              hand, known, nxt, logp, result, weight))
+                              hand, known, nxt, logp, result, weight,
+                              header[:, spec.header["tick"][0]]))
     return loss, stats
 
 
 @torch.no_grad()
 def _metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w, hand, known, nxt,
-             logp, result, weight) -> dict:
+             logp, result, weight, ticks) -> dict:
     """Sums and counts, merged over validation batches by :func:`evaluate`."""
+    phase = torch.div(ticks.long(), MINUTE, rounding_mode="floor").clamp(max=PHASES - 1)
+    decided = (result != 0).float() * weight
+    right = ((out["value"].float() > 0) == (result > 0)).float() * decided
+    by_phase = {}
+    for k in range(PHASES):
+        at = (phase == k).float()
+        by_phase[f"sign_ok_{k}"] = (right * at).sum().item()
+        by_phase[f"sign_n_{k}"] = (decided * at).sum().item()
     on = w > 0
     play_on = on[play_rows]
     slot_logits = type_logits[play_rows, 1:1 + spec.hand_slots]
@@ -178,7 +235,7 @@ def _metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w, hand
             "value_se": (weight * (out["value"].float() - result) ** 2).sum().item(),
             "weight": weight.sum().item(),
             "hand_hit": hand_hit.sum().item(), "hand_known": known.sum().item(),
-            "next_ok": next_ok.sum().item(), "next_known": (nxt >= 0).sum().item()}
+            "next_ok": next_ok.sum().item(), "next_known": (nxt >= 0).sum().item(), **by_phase}
 
 
 @torch.no_grad()
@@ -207,6 +264,8 @@ def evaluate(net, rows: Rows, indices: np.ndarray, *, policy_rows: str, loss_wei
         "value_mse": sums["value_se"] / max(1e-9, sums["weight"]),
         "hand_top4_recall": sums["hand_hit"] / max(1, sums["hand_known"]),
         "next_card_acc": sums["next_ok"] / max(1, sums["next_known"]),
+        "value_sign_by_minute": [round(sums[f"sign_ok_{k}"] / max(1e-9, sums[f"sign_n_{k}"]), 4)
+                                 for k in range(PHASES)],
         "plays": int(sums["n_play"]),
     }
 
@@ -234,8 +293,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--d", type=int, default=384)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--heads", type=int, default=6)
+    p.add_argument("--ema", type=float, default=0.9995,
+                   help="decay of the averaged weights that are validated and saved (0: off)")
+    p.add_argument("--value-only", action="store_true",
+                   help="fit a fresh value head on the frozen --init network, stopping on its error")
+    p.add_argument("--value-dropout", type=float, default=0.1,
+                   help="with --value-only: dropout on the value head's input")
+    p.add_argument("--profile", type=int, default=0,
+                   help="run this many steps under the profiler, write profile.json and stop")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.value_only and not args.init:
+        raise SystemExit("--value-only needs --init: the network whose value head to fit")
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
@@ -246,7 +315,7 @@ def main(argv: list[str] | None = None) -> None:
     torch.backends.cudnn.allow_tf32 = True
     t0 = time.time()
     rows = Rows(paths.data_root() / "rows" / args.rows)
-    print(f"loaded {rows.n:,} rows in {time.time() - t0:.0f} s", flush=True)
+    print(f"opened {rows.n:,} rows in {time.time() - t0:.0f} s", flush=True)
     spec = Spec.from_metadata(rows.metadata)
     if args.init:
         net, _ = load_net(Path(args.init), device)
@@ -266,12 +335,30 @@ def main(argv: list[str] | None = None) -> None:
         val_idx = np.sort(rng.choice(val_idx, args.eval_rows, replace=False))
     print(f"train rows {len(train_idx):,}; validation rows {len(val_idx):,}", flush=True)
 
-    embeddings = ("card.", "cast.", "buff.", "token_type.", "position.", "kind.", "side.", "state.")
-    decay = [p for n, p in net.named_parameters() if p.dim() >= 2 and not n.startswith(embeddings)]
-    other = [p for p in net.parameters() if all(p is not q for q in decay)]
+    if args.value_only:
+        # Everything but the value head is frozen; the head starts afresh.
+        net.eval()
+        for prm in net.parameters():
+            prm.requires_grad_(False)
+        for m in net.value_head:
+            if isinstance(m, torch.nn.Linear):
+                m.reset_parameters()
+        for prm in net.value_head.parameters():
+            prm.requires_grad_(True)
+        decay = [prm for prm in net.value_head.parameters() if prm.dim() >= 2]
+        other = [prm for prm in net.value_head.parameters() if prm.dim() < 2]
+    else:
+        embeddings = ("card.", "cast.", "buff.", "token_type.", "position.", "kind.", "side.",
+                      "state.")
+        decay = [prm for n, prm in net.named_parameters()
+                 if prm.dim() >= 2 and not n.startswith(embeddings)]
+        other = [prm for prm in net.parameters() if all(prm is not q for q in decay)]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
                              {"params": other, "weight_decay": 0.0}], lr=args.lr,
                             betas=(0.9, 0.98), fused=True)
+    ema = EMA(net, args.ema) if args.ema and not args.value_only else None
+    # The selection metric: the policy loss, or for --value-only the value error.
+    key = "value_mse" if args.value_only else "policy_nll"
 
     def lr_at(step):
         if step < args.warmup:
@@ -282,18 +369,48 @@ def main(argv: list[str] | None = None) -> None:
     out = paths.runs_dir() / "bc" / args.name
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps(vars(args), indent=1))
-    log = open(out / "metrics.jsonl", "a", encoding="utf-8")
     batches = Batches(rows, train_idx, args.batch, net.config.max_entities, args.seed)
     common = {"policy_rows": args.policy_rows, "loss_weight": args.loss_weight,
               "value_weight": args.value_weight}
+
+    def train_step(step: int) -> tuple[dict, float]:
+        for g in opt.param_groups:
+            g["lr"] = lr_at(step)
+        t = time.perf_counter()
+        b = batches.next(device)
+        waited = time.perf_counter() - t
+        if args.value_only:
+            loss, s = value_loss(net, b, mirror=args.mirror, dropout=args.value_dropout)
+        else:
+            loss, s = forward_losses(net, b, mirror=args.mirror, **common)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([q for g in opt.param_groups for q in g["params"]], 1.0)
+        opt.step()
+        if ema:
+            ema.update(net, step)
+        return s, waited
+
+    if args.profile:
+        try:
+            _profile(train_step, args.profile, out)
+        finally:
+            batches.close()
+        return
+
+    log = open(out / "metrics.jsonl", "a", encoding="utf-8")
     best = math.inf
     stale = 0  # validations since the best
     running: dict = {}
-    t0 = time.time()
+    waited = 0.0
+    t0 = tick = time.time()
     try:
         for step in range(args.steps + 1):
             if step % args.eval_every == 0 or step == args.steps:
-                m = evaluate(net, rows, val_idx, batch=args.batch, device=device, **common)
+                judged = ema.net if ema else net
+                m = evaluate(judged, rows, val_idx, batch=args.batch, device=device, **common)
+                if args.value_only:
+                    net.eval()  # evaluate() leaves it training; the frozen trunk stays in eval
                 m.update(step=step, minutes=round((time.time() - t0) / 60, 1),
                          train={k: v / max(1, running.get("_n", 1)) for k, v in running.items()
                                 if k != "_n"})
@@ -303,42 +420,67 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"step {step}: val policy nll {m['policy_nll']:.4f}, card {m['card_acc']:.3f}, "
                       f"cell {m['cell_acc']:.3f} (within 1: {m['cell_within_1']:.3f}), act recall "
                       f"{m['act_recall']:.3f} precision {m['act_precision']:.3f}, value mse "
-                      f"{m['value_mse']:.3f}, hand top4 {m['hand_top4_recall']:.3f}, next card "
-                      f"{m['next_card_acc']:.3f} [{m['minutes']} min]", flush=True)
-                state = {"model": net.state_dict(), "description": net.describe(), "step": step,
-                         "metadata": rows.metadata,
-                         "args": vars(args), "metrics": m}
-                torch.save(state, out / "last.pt")
-                if m["policy_nll"] < best - 1e-4:
-                    best, stale = m["policy_nll"], 0
+                      f"{m['value_mse']:.3f} (sign right by minute "
+                      f"{', '.join(f'{x:.0%}' for x in m['value_sign_by_minute'])}), hand top4 "
+                      f"{m['hand_top4_recall']:.3f}, next card {m['next_card_acc']:.3f} "
+                      f"[{m['minutes']} min]", flush=True)
+                state = {"model": judged.state_dict(), "description": judged.describe(),
+                         "step": step, "metadata": rows.metadata, "args": vars(args), "metrics": m}
+                if ema:
+                    torch.save({**state, "raw_model": net.state_dict()}, out / "last.pt")
+                else:
+                    torch.save(state, out / "last.pt")
+                if m[key] < best - 1e-4:
+                    best, stale = m[key], 0
                     torch.save(state, out / "best.pt")
                 else:
                     stale += 1
                 if step == args.steps:
                     break
                 if args.patience and stale >= args.patience:
-                    print(f"stopping early: no better validation policy loss in {stale} "
+                    print(f"stopping early: no better validation {key} in {stale} "
                           f"validations ({stale * args.eval_every} steps)", flush=True)
                     break
-            for g in opt.param_groups:
-                g["lr"] = lr_at(step)
-            b = batches.next(device)
-            loss, s = forward_losses(net, b, mirror=args.mirror, **common)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            opt.step()
+            s, w = train_step(step)
+            waited += w
             for k, v in s.items():
                 running[k] = running.get(k, 0.0) + v
             running["_n"] = running.get("_n", 0) + 1
             if step % 200 == 0 and step:
-                rate = step * args.batch / (time.time() - t0)
-                print(f"  step {step} loss {s['loss']:.4f} policy {s['policy']:.4f} "
-                      f"({rate:,.0f} rows/s)", flush=True)
+                now = time.time()
+                rate = step * args.batch / (now - t0)
+                print(f"  step {step} loss {s['loss']:.4f} {key.split('_')[0]} "
+                      f"{s['value' if args.value_only else 'policy']:.4f} ({rate:,.0f} rows/s, "
+                      f"waiting for data {waited / max(1e-9, now - tick):.0%})", flush=True)
+                waited, tick = 0.0, now
     finally:
         batches.close()
         log.close()
-    print(f"done; best validation policy nll {best:.4f}; checkpoints in {out}")
+    print(f"done; best validation {key} {best:.4f}; checkpoints in {out}")
+
+
+def _profile(train_step, steps: int, out: Path) -> None:
+    """Runs ``steps`` training steps under the profiler, after 5 to warm up, and writes the trace."""
+    from torch.profiler import ProfilerActivity, profile, schedule
+
+    trace = out / "profile.json"
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 schedule=schedule(wait=2, warmup=3, active=steps),
+                 on_trace_ready=lambda prof: prof.export_chrome_trace(str(trace))) as prof:
+        waited = 0.0
+        t0 = time.perf_counter()
+        for step in range(5 + steps):
+            if step == 5:
+                torch.cuda.synchronize()
+                waited, t0 = 0.0, time.perf_counter()
+            waited += train_step(step)[1]
+            prof.step()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+    print(f"{steps} steps in {elapsed:.1f} s ({elapsed / steps * 1000:.0f} ms a step), "
+          f"{waited / elapsed:.0%} of it waiting for data")
+    print(f"trace written to {trace}: open it at https://ui.perfetto.dev (it stays on this machine)")
 
 
 if __name__ == "__main__":

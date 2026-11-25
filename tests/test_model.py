@@ -27,6 +27,19 @@ def data():
     return rows, spec, rows.gather(idx, 80)
 
 
+def test_mapped_rows_gather_the_same_batches_as_loaded_rows(data):
+    from clashai.train.rows import Rows
+
+    rows, _, _ = data
+    loaded = Rows(ROWS, mmap=False)
+    assert isinstance(rows.header, np.memmap) and not isinstance(loaded.header, np.memmap)
+    idx = np.sort(np.random.default_rng(1).choice(rows.n, 300, replace=False))
+    a, b = rows.gather(idx, 80), loaded.gather(idx, 80)
+    assert a.keys() == b.keys()
+    for k in a:
+        np.testing.assert_array_equal(a[k], b[k])
+
+
 def test_actions_decode_and_encode_back(data):
     _, spec, _ = data
     a = torch.arange(spec.actions)

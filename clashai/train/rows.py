@@ -147,15 +147,24 @@ def build(dataset: str, wait_keep: float, seed: int = 0, out_name: str | None = 
 
 
 class Rows:
-    """A rows folder loaded into RAM."""
+    """A rows folder, its arrays mapped from disk (``mmap``, the default) or loaded into RAM.
 
-    def __init__(self, folder: Path):
+    Mapped, a folder larger than RAM still trains: the operating system keeps the pages read
+    most in its cache and reads the rest from the SSD as batches need them.
+    """
+
+    def __init__(self, folder: Path, mmap: bool = True):
         self.folder = Path(folder)
         self.info = json.loads((self.folder / "rows.json").read_text())
         self.metadata = json.loads((self.folder / "metadata.json").read_text())
         for name, a in self.info["arrays"].items():
-            data = np.fromfile(self.folder / f"{name}.bin", dtype=a["dtype"])
-            setattr(self, name, data.reshape(a["shape"]))
+            path = self.folder / f"{name}.bin"
+            shape = tuple(a["shape"])
+            if mmap and np.prod(shape) > 0:
+                data = np.memmap(path, dtype=a["dtype"], mode="r", shape=shape)
+            else:
+                data = np.fromfile(path, dtype=a["dtype"]).reshape(shape)
+            setattr(self, name, data)
         self.n = self.info["rows"]
 
     def gather(self, idx: np.ndarray, max_entities: int) -> dict:
