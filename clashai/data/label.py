@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> None:
             run = label_replays([source / "docs" / f"{r['tag']}.json" for r in chunk],
                                 paths.install_dir(), paths.tables_dir(), decision_ticks=5,
                                 threads=args.threads or paths.cpu_budget(),
-                                check=args.check, out_dir=raw)
+                                check=args.check, out_dir=raw, jvm_args=paths.jvm_args())
             if layout is None:
                 metadata = (raw / "metadata.json").read_text()
                 (out / "metadata.json").write_text(metadata)

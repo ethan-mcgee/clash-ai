@@ -465,7 +465,8 @@ def main(argv: list[str] | None = None) -> None:
     vector = VectorBattle(min(args.batch, len(replays)), args.threads or paths.cpu_budget(),
                           install=paths.install_dir(), tables=paths.tables_dir(),
                           config=LadderConfig(decision_ticks=1, level=DEFAULT_LEVEL,
-                                              tower_level=DEFAULT_LEVEL, arena=ARENA))
+                                              tower_level=DEFAULT_LEVEL, arena=ARENA),
+                          jvm_args=paths.jvm_args())
     names = CardNames(vector.vocabulary[i] for i in vector.card_types())
     table = SeedTable()
     rng = np.random.default_rng(args.seed)

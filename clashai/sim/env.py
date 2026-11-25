@@ -30,4 +30,4 @@ def make_vector(count: int, threads: int | None = None, *, decision_ticks: int =
                           max_ticks=max_ticks)
     return VectorBattle(count, threads or paths.default_threads(), install=paths.install_dir(),
                         tables=paths.tables_dir(), config=config, fields=fields,
-                        jvm_args=jvm_args)
+                        jvm_args=[*paths.jvm_args(), *jvm_args])

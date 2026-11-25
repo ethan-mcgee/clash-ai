@@ -78,7 +78,7 @@ def ensure_engine(force: bool = False) -> None:
         _checked = True
         return
     java = ensure_java()
-    env = dict(os.environ, JAVA_HOME=str(java),
+    env = dict(os.environ, JAVA_HOME=str(java), JAVA_TOOL_OPTIONS=" ".join(jvm_args()),
                GRADLE_USER_HOME=os.environ.get("GRADLE_USER_HOME",
                                                str(data_root() / "gradle-home")))
     gradlew = CRFORGE / ("gradlew.bat" if os.name == "nt" else "gradlew")
@@ -162,12 +162,6 @@ def apply_cpu_cap() -> int:
         os.environ.setdefault(var, str(max(1, n // 2)))
     total = os.cpu_count() or 1
     if n < total:
-        # The JVM on Windows counts every processor despite the mask, and would size its garbage
-        # collector and compiler pools for all of them. Every JVM started from here (crforge's,
-        # inside this process, and Gradle's) reads this; it says "Picked up JAVA_TOOL_OPTIONS".
-        options = os.environ.get("JAVA_TOOL_OPTIONS", "")
-        if "ActiveProcessorCount" not in options:
-            os.environ["JAVA_TOOL_OPTIONS"] = f"{options} -XX:ActiveProcessorCount={n}".strip()
         if os.name == "nt":
             import ctypes
             from ctypes import wintypes
@@ -181,6 +175,16 @@ def apply_cpu_cap() -> int:
         elif hasattr(os, "sched_setaffinity"):
             os.sched_setaffinity(0, range(n))
     return n
+
+
+def jvm_args() -> list[str]:
+    """Options for every JVM the program starts. The JVM on Windows counts every processor
+    despite the affinity mask and would size its garbage collector and compiler pools for all of
+    them, so it is told the budget. Passed at the JVM's start (``jvm_args`` of crforge's
+    VectorBattle and label_replays), not through JAVA_TOOL_OPTIONS, whose notice on stderr
+    Windows PowerShell 5.1 reports as an error."""
+    n = cpu_budget()
+    return [f"-XX:ActiveProcessorCount={n}"] if n < (os.cpu_count() or 1) else []
 
 
 def default_threads() -> int:
