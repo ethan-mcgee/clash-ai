@@ -27,6 +27,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import os
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -423,6 +424,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--deck", choices=["piggies_eq", "all"], default="piggies_eq")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--threads", type=int, default=None,
+                        help="engine threads; all logical CPUs by default (conversion is engine work)")
     parser.add_argument("--mapping", choices=["native", "screen", "rotate"], default="screen")
     parser.add_argument("--sides", choices=["team0", "data_i"], default="team0")
     parser.add_argument("--out", type=Path, default=None)
@@ -460,7 +463,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     events = load_events(root, {r.tag for r in replays})
     paths.ensure_java()
-    vector = VectorBattle(min(args.batch, len(replays)), paths.default_threads(),
+    vector = VectorBattle(min(args.batch, len(replays)), args.threads or os.cpu_count() or 1,
                           install=paths.install_dir(), tables=paths.tables_dir(),
                           config=LadderConfig(decision_ticks=1, level=DEFAULT_LEVEL,
                                               tower_level=DEFAULT_LEVEL, arena=ARENA))
