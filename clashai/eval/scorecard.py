@@ -12,6 +12,7 @@ import argparse
 import json
 import time
 from dataclasses import asdict
+from pathlib import Path
 
 from .. import paths
 from ..decks import PIGGIES_EQ, REFERENCE_DECKS, is_held_out
@@ -20,13 +21,18 @@ from .arena import Side, play
 from .stats import summarize
 
 
-def make_policy(name: str, temperature: float = 1.0):
+def make_policy(name: str, temperature: float = 1.0, **sampling):
+    """A baseline by name, or a checkpoint; ``sampling`` takes NetPolicy's card and tile
+    settings, and any not at 1 are added to the policy's name."""
     if name in BASELINES:
         return BASELINES[name]()
     if name.endswith(".pt"):
         from ..model.policy import NetPolicy
 
-        return NetPolicy(name, temperature=temperature)
+        tags = {"card_temperature": "ct", "tile_temperature": "tt", "tile_top_p": "tp"}
+        label = Path(name).parent.name + "".join(f"-{tags[k]}{v:g}" for k, v in sampling.items()
+                                                 if v != 1.0)
+        return NetPolicy(name, temperature=temperature, name=label, **sampling)
     raise SystemExit(f"unknown policy {name!r}: one of {sorted(BASELINES)} or a .pt checkpoint")
 
 
@@ -36,6 +42,12 @@ def main(argv: list[str] | None = None) -> None:
                         help=f"one of {sorted(BASELINES)} or a checkpoint (.pt) path")
     parser.add_argument("--opponent", default="scripted", help="as --policy")
     parser.add_argument("--temperature", type=float, default=1.0, help="for checkpoint policies")
+    parser.add_argument("--card-temperature", type=float, default=1.0,
+                        help="--policy only: which card, given that it plays")
+    parser.add_argument("--tile-temperature", type=float, default=1.0,
+                        help="--policy only: where it plays")
+    parser.add_argument("--tile-top-p", type=float, default=1.0,
+                        help="--policy only: sample among the likeliest tiles holding this share")
     parser.add_argument("--seeds", type=int, default=50, help="seeds per deck; 2 games each")
     parser.add_argument("--first-seed", type=int, default=1_000_000)
     parser.add_argument("--decks", nargs="*", default=list(REFERENCE_DECKS))
@@ -44,7 +56,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     seeds = list(range(args.first_seed, args.first_seed + args.seeds))
-    policy = make_policy(args.policy, args.temperature)
+    policy = make_policy(args.policy, args.temperature, card_temperature=args.card_temperature,
+                         tile_temperature=args.tile_temperature, tile_top_p=args.tile_top_p)
     opponent = make_policy(args.opponent, args.temperature)
     rows, record, every = [], {}, []
     t0 = time.time()
