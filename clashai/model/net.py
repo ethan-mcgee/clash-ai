@@ -46,6 +46,7 @@ class Config:
     heads: int = 6
     grid_channels: int = 64
     max_entities: int = 80
+    dropout: float = 0.0  # in the trunk's attention and feed-forward layers, while training
 
 
 def _onehot(x: torch.Tensor, n: int) -> torch.Tensor:
@@ -93,7 +94,7 @@ class PolicyNet(nn.Module):
         self.entity_in = nn.Linear(ENTITY_NUMERIC, d)
         self.buff_ms_in = nn.Linear(3, d)
         self.norm_in = nn.LayerNorm(d)
-        layer = nn.TransformerEncoderLayer(d, self.config.heads, 4 * d, dropout=0.0,
+        layer = nn.TransformerEncoderLayer(d, self.config.heads, 4 * d, dropout=self.config.dropout,
                                            activation="gelu", batch_first=True, norm_first=True)
         self.trunk = nn.TransformerEncoder(layer, self.config.layers, enable_nested_tensor=False)
         self.norm_out = nn.LayerNorm(d)
@@ -111,6 +112,15 @@ class PolicyNet(nn.Module):
         self.grid_out = nn.Conv2d(c, 1, 1)
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
+
+    def set_dropout(self, p: float) -> None:
+        """Change the trunk's dropout, for a run that starts from another run's checkpoint."""
+        self.config.dropout = p
+        for m in self.modules():
+            if isinstance(m, nn.Dropout):
+                m.p = p
+            elif isinstance(m, nn.MultiheadAttention):
+                m.dropout = p
 
     def describe(self) -> dict:
         return {"spec": self.spec.to_dict(), "config": asdict(self.config)}

@@ -1,8 +1,8 @@
 """Imitation: train the policy on human rows.
 
-    python -m clashai.train.bc --name generalist --rows <rows folder> --steps 60000
+    python -m clashai.train.bc --name generalist --rows <rows folder> --steps 40000
     python -m clashai.train.bc --name specialist --rows <piggies rows> --init <generalist ckpt> \
-        --policy-rows piggies --steps 20000
+        --policy-rows piggies --steps 10000 --lr 1e-4 --eval-every 1000
 
 Losses, per row weighted by its wait-sampling weight:
 
@@ -10,10 +10,15 @@ Losses, per row weighted by its wait-sampling weight:
   the slot, under the row's mask. A label the mask closes (given a tick or two after the decision)
   is opened for its row rather than dropped. Rows of a lost game count ``--loss-weight`` as much as
   a won one; with ``--policy-rows piggies`` only the Piggies EQ seat's rows train the policy.
-- value: squared error to the seat's result (-1, 0, 1)
+- value: squared error to the seat's result (-1, 0, 1), weighted ``--value-weight``. Its head
+  reads the trunk's output detached: a battle has one result and hundreds of nearly identical
+  rows, so a value loss that reaches the trunk teaches it to recognise battles, not positions
+  (the Piggies EQ baseline's value error rose above a constant guess's while its policy overfit).
 - belief: the enemy's hand now (a soft target over its four cards) and its next card
 
 Rows are mirrored left to right with probability ``--mirror``. Validation is on held-out battles.
+The trunk trains with ``--dropout``. A run stops early once ``--patience`` validations in a row
+fail to improve the policy loss; ``best.pt`` is the checkpoint with the lowest one.
 """
 
 from __future__ import annotations
@@ -82,7 +87,8 @@ def to_device(b: dict, device) -> dict:
 
 
 def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: float,
-                   mirror: float = 0.0, metrics: bool = False) -> tuple[torch.Tensor, dict]:
+                   mirror: float = 0.0, value_weight: float = 0.1,
+                   metrics: bool = False) -> tuple[torch.Tensor, dict]:
     spec = net.spec
     header, entities, valid = b["header"], b["entities"], b["valid"]
     mask = unpack_masks(b["masks"], spec.actions)
@@ -110,6 +116,9 @@ def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: fl
         tile_mask[torch.arange(len(play_rows), device=kind.device), tile[play_rows]] = True
         tile_logits = net.tile_logits(out, play_rows, slot).float().masked_fill(~tile_mask, NEG)
         nll_tile = F.cross_entropy(tile_logits, tile[play_rows], reduction="none")
+        # The value head trains on a detached trunk (see the module notes); out["value"] is the
+        # same number, with the gradient path into the trunk.
+        value_pred = torch.tanh(net.value_head(out["match"].detach()).squeeze(-1))
 
     weight = b["weight"].float()
     result = b["result"].float()
@@ -120,7 +129,7 @@ def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: fl
     nll[play_rows] += nll_tile
     policy = (w * nll).sum() / w.sum().clamp(min=1e-6)
 
-    value = (weight * (out["value"].float() - result) ** 2).sum() / weight.sum()
+    value = (weight * (value_pred.float() - result) ** 2).sum() / weight.sum()
 
     hand = b["opp_hand"].long()
     known = hand >= 0
@@ -131,7 +140,7 @@ def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: fl
     next_nll = F.cross_entropy(out["next_belief"].float(), nxt.clamp(min=0), reduction="none")
     belief_next = (weight * next_nll * (nxt >= 0)).sum() / (weight * (nxt >= 0)).sum().clamp(min=1)
 
-    loss = policy + 0.5 * value + 0.1 * belief_hand + 0.1 * belief_next
+    loss = policy + value_weight * value + 0.1 * belief_hand + 0.1 * belief_next
     stats = {"loss": loss.item(), "policy": policy.item(), "value": value.item(),
              "belief_hand": belief_hand.item(), "belief_next": belief_next.item()}
     if metrics:
@@ -174,13 +183,13 @@ def _metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w, hand
 
 @torch.no_grad()
 def evaluate(net, rows: Rows, indices: np.ndarray, *, policy_rows: str, loss_weight: float,
-             batch: int, device) -> dict:
+             batch: int, device, value_weight: float = 0.1) -> dict:
     net.eval()
     sums: dict = {}
     for start in range(0, len(indices), batch):
         b = to_device(rows.gather(indices[start:start + batch], net.config.max_entities), device)
         _, s = forward_losses(net, b, policy_rows=policy_rows, loss_weight=loss_weight,
-                              metrics=True)
+                              value_weight=value_weight, metrics=True)
         for k, v in s.pop("sums").items():
             sums[k] = sums.get(k, 0.0) + v
         for k, v in s.items():  # batch means, weighted by batch size
@@ -213,6 +222,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup", type=int, default=1000)
     p.add_argument("--weight-decay", type=float, default=0.05)
+    p.add_argument("--dropout", type=float, default=0.1,
+                   help="trunk dropout (replaces an --init checkpoint's)")
+    p.add_argument("--value-weight", type=float, default=0.1)
+    p.add_argument("--patience", type=int, default=3,
+                   help="stop after this many validations without a better policy loss (0: never)")
     p.add_argument("--loss-weight", type=float, default=0.5, help="policy weight of lost games")
     p.add_argument("--mirror", type=float, default=0.5)
     p.add_argument("--eval-every", type=int, default=2000)
@@ -236,10 +250,12 @@ def main(argv: list[str] | None = None) -> None:
     spec = Spec.from_metadata(rows.metadata)
     if args.init:
         net, _ = load_net(Path(args.init), device)
+        net.set_dropout(args.dropout)
         net.train()
         assert net.spec.to_dict() == spec.to_dict(), "the rows' layout differs from the checkpoint's"
     else:
-        net = PolicyNet(spec, Config(d=args.d, layers=args.layers, heads=args.heads)).to(device)
+        net = PolicyNet(spec, Config(d=args.d, layers=args.layers, heads=args.heads,
+                                    dropout=args.dropout)).to(device)
     print(f"{sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters", flush=True)
 
     keep = rows.piggies if args.policy_rows == "piggies" else np.ones(rows.n, bool)
@@ -268,8 +284,10 @@ def main(argv: list[str] | None = None) -> None:
     (out / "args.json").write_text(json.dumps(vars(args), indent=1))
     log = open(out / "metrics.jsonl", "a", encoding="utf-8")
     batches = Batches(rows, train_idx, args.batch, net.config.max_entities, args.seed)
-    common = {"policy_rows": args.policy_rows, "loss_weight": args.loss_weight}
+    common = {"policy_rows": args.policy_rows, "loss_weight": args.loss_weight,
+              "value_weight": args.value_weight}
     best = math.inf
+    stale = 0  # validations since the best
     running: dict = {}
     t0 = time.time()
     try:
@@ -291,10 +309,16 @@ def main(argv: list[str] | None = None) -> None:
                          "metadata": rows.metadata,
                          "args": vars(args), "metrics": m}
                 torch.save(state, out / "last.pt")
-                if m["policy_nll"] < best:
-                    best = m["policy_nll"]
+                if m["policy_nll"] < best - 1e-4:
+                    best, stale = m["policy_nll"], 0
                     torch.save(state, out / "best.pt")
+                else:
+                    stale += 1
                 if step == args.steps:
+                    break
+                if args.patience and stale >= args.patience:
+                    print(f"stopping early: no better validation policy loss in {stale} "
+                          f"validations ({stale * args.eval_every} steps)", flush=True)
                     break
             for g in opt.param_groups:
                 g["lr"] = lr_at(step)

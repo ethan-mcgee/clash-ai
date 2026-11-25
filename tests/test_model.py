@@ -164,3 +164,40 @@ def test_the_explicit_trunk_for_export_equals_the_trunk(data):
         got = net.trunk_explicit(tokens, pad)
     live = ~pad  # padded tokens' outputs are never read
     torch.testing.assert_close(got[live], want[live], rtol=1e-4, atol=1e-4)
+
+
+def test_dropout_is_saved_with_the_model_and_can_be_changed(data):
+    _, spec, _ = data
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16, dropout=0.1))
+    again = PolicyNet.from_description(net.describe())
+    assert again.config.dropout == 0.1
+    assert {m.p for m in again.modules() if isinstance(m, torch.nn.Dropout)} == {0.1}
+    again.set_dropout(0.0)
+    assert {m.p for m in again.modules() if isinstance(m, torch.nn.Dropout)} == {0.0}
+    assert all(m.dropout == 0.0 for m in again.modules()
+               if isinstance(m, torch.nn.MultiheadAttention))
+    old = net.describe()
+    del old["config"]["dropout"]  # checkpoints from before dropout existed
+    assert PolicyNet.from_description(old).config.dropout == 0.0
+
+
+def test_the_value_loss_trains_the_value_head_but_not_the_trunk(data):
+    from clashai.train.bc import forward_losses, to_device
+
+    _, spec, b = data
+    torch.manual_seed(0)
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16))
+    batch = to_device(b, "cpu")
+    grads = []
+    for value_weight in (0.0, 1.0):
+        net.zero_grad()
+        loss, _ = forward_losses(net, batch, policy_rows="all", loss_weight=0.5,
+                                 value_weight=value_weight)
+        loss.backward()
+        grads.append({n: p.grad.clone() for n, p in net.named_parameters() if p.grad is not None})
+    without, with_value = grads
+    for name, g in with_value.items():
+        if name.startswith("value_head."):
+            assert name not in without or not torch.equal(g, without[name])
+        else:
+            torch.testing.assert_close(g, without[name])
