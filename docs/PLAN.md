@@ -122,6 +122,7 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
 **M2. Imitation**
 - Generalist, then specialist.
 - Exit: held-out card and cell accuracy reported (RoyaleFish's 63.5% and 31.5% as a rough yardstick); the specialist beats the generalist piloting Piggies EQ.
+- Result (`docs/IMITATION.md`): card 70.1% and tile 34.7% on Piggies EQ validation, above the yardstick. The specialist does not beat the generalist in games (41.3% against 42.6%, intervals overlapping), so that criterion is not met; M3 starts from the generalist.
 
 **M3. PPO league**
 - Exit: on held-out decks and pilots, the PPO specialist beats the imitation specialist with an interval clear of 50%, and behaviour metrics stay near human ranges.
