@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * Porting this code? Please cite this file and the commit you read: see the README.
  */
+// Modified for clash-ai: setDecks, to give one environment new decks for its next episode.
 
 package org.crforge.env;
 
@@ -609,6 +610,45 @@ public final class VectorEnv implements AutoCloseable {
       throw new IllegalArgumentException(
           "environment " + index + ", side " + side + ": " + e.getMessage(), e);
     }
+  }
+
+  /**
+   * Gives one environment new decks and slot flags for its next episode, whether an autoreset or
+   * {@link #resetEnv(int, int)} starts it; the episode in play keeps its decks. Its setups stay.
+   * The decks are checked first: a bad one refuses the call and changes nothing. A trainer calls
+   * this for an environment whose episode just ended, before the step that autoresets it.
+   *
+   * @param index the environment
+   * @param deck0 side 0's deck, {@link Schema#DECK_SIZE} names
+   * @param deck1 side 1's deck
+   * @param slots0 side 0's slot flags, one per card; null for none
+   * @param slots1 side 1's slot flags, as {@code slots0}
+   */
+  public void setDecks(int index, String[] deck0, String[] deck1, int[] slots0, int[] slots1) {
+    if (!started) {
+      throw new IllegalStateException("reset the whole vector first, which gives the decks");
+    }
+    if (index < 0 || index >= envs.length) {
+      throw new IllegalArgumentException("no environment " + index);
+    }
+    if (deck0.length != Schema.DECK_SIZE || deck1.length != Schema.DECK_SIZE) {
+      throw new IllegalArgumentException("a deck is " + Schema.DECK_SIZE + " card names");
+    }
+    int[] f0 = slots0 == null ? new int[Schema.DECK_SIZE] : slots0.clone();
+    int[] f1 = slots1 == null ? new int[Schema.DECK_SIZE] : slots1.clone();
+    if (f0.length != Schema.DECK_SIZE || f1.length != Schema.DECK_SIZE) {
+      throw new IllegalArgumentException("slot flags are one per card of the deck");
+    }
+    List<String> d0 = List.of(deck0);
+    List<String> d1 = List.of(deck1);
+    checkDeck(index, 0, d0, f0);
+    checkDeck(index, 1, d1, f1);
+    checkSetup(index, 0, d0, setup0s.get(index));
+    checkSetup(index, 1, d1, setup1s.get(index));
+    deck0s.set(index, d0);
+    deck1s.set(index, d1);
+    slots0s.set(index, f0);
+    slots1s.set(index, f1);
   }
 
   /**

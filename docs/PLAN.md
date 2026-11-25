@@ -125,6 +125,14 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
 - Result (`docs/IMITATION.md`): card 70.1% and tile 34.7% on Piggies EQ validation, above the yardstick. The specialist does not beat the generalist in games (41.3% against 42.6%, intervals overlapping), so that criterion is not met; M3 starts from the generalist.
 
 **M3. PPO league**
+- Built (`clashai/train/ppo.py`, `clashai/train/league.py`):
+  - The learner starts from the generalist and plays Piggies EQ from a random seat in 512 battles at once.
+  - Opponents: the decks Piggies EQ meets in the replays (1,524 distinct, held-out decks excluded), drawn half by replay frequency and half weighted toward the decks it loses to. A deck's loss rate is pooled over the decks sharing 6 of its 8 cards. The frozen generalist pilots them. 10% of games are the mirror against one of the learner's last 5 snapshots.
+  - Reward: the result (+1, -1, 0) plus potential-based tower shaping (0.5 x own tower share less the enemy's).
+  - Loss: PPO's clipped surrogate, a value loss whose gradient reaches the shared trunk at 0.1, entropy 0.001, and KL 0.05 to the generalist on the learner's own decisions. The first 5 iterations train the critic alone.
+  - crforge gained `set_decks`, so a battle can play a new opponent deck after every game (`docs/CRFORGE.md`).
+  - Speed: an iteration is 512 battles x 128 decisions in about 50 s, about 4,000 games an hour.
+- Still to do: the exploiter pilot, promotion gates, and a held-out pilot for the exit test (the generalist pilots both training and evaluation games for now).
 - Exit: on held-out decks and pilots, the PPO specialist beats the imitation specialist with an interval clear of 50%, and behaviour metrics stay near human ranges.
 
 **M4. Search**

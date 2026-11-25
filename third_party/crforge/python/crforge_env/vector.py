@@ -1,5 +1,7 @@
 """The vector of battles: one JVM call a decision for every battle, the results read in place.
 
+Modified for clash-ai: ``set_decks``, to give one environment new decks for its next episode.
+
 :class:`VectorBattle` wraps the env module's ``org.crforge.env.VectorEnv``. Its buffers are direct
 memory in the machine's byte order; the numpy arrays here are views of that memory, made once, so
 a step moves no bytes across the bridge: Python writes the actions into ``actions``, calls
@@ -513,6 +515,22 @@ class VectorBattle:
                 raise ValueError(f"a deck has {self.schema.deck_size} cards, got {len(deck)}")
             flat.extend(str(card) for card in deck)
         return flat
+
+    def set_decks(self, index: int, deck0: Sequence[str], deck1: Sequence[str],
+                  slots0: Sequence[int] | None = None, slots1: Sequence[int] | None = None) -> None:
+        """Gives environment ``index`` new decks and slot flags for its next episode, started by
+        the autoreset or :meth:`reset_env`; the episode in play keeps its decks, and its setups
+        stay. Call it for an environment whose episode just ended, before the next ``step``.
+
+        :raises ValueError: for a bad deck or slot flags, changing nothing
+        """
+        j_slots = [None if s is None else jpype.JArray(jpype.JInt)([int(x) for x in s])
+                   for s in (slots0, slots1)]
+        try:
+            self._env.setDecks(int(index), jpype.JArray(jpype.JString)(list(deck0)),
+                               jpype.JArray(jpype.JString)(list(deck1)), *j_slots)
+        except self._illegal_argument as e:
+            raise ValueError(str(e.getMessage())) from None
 
     def reset_env(self, index: int, seed: int) -> None:
         """Restarts one environment with a seed, keeping its decks."""

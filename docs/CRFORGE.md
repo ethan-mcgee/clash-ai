@@ -28,7 +28,7 @@ A change to the battle core breaks crforge's tick-exact match with the real game
 
 | File | Change | Why | Commit |
 |---|---|---|---|
-| (none yet) | | | |
+| `env/.../VectorEnv.java`, `python/crforge_env/vector.py` | `setDecks` / `set_decks`: new decks for one environment's next episode | PPO draws a new opponent deck every game; without it a battle keeps its decks through every autoreset | M3 |
 
 ## Pulling upstream updates
 
