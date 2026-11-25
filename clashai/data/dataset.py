@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,7 +103,7 @@ def main(argv: list[str] | None = None) -> None:
     jobs = [(f, target / "battles" / (f.name.split("_docs_")[-1].removesuffix(".json.npz") + ".npz"),
              layout, args.verify < 0 or i < args.verify) for i, f in enumerate(files)]
     rows = bad = 0
-    with ProcessPoolExecutor(max_workers=os.cpu_count() // 2) as pool:
+    with ProcessPoolExecutor(max_workers=max(1, paths.cpu_budget() // 2)) as pool:
         for name, n, ok in pool.map(_job, jobs, chunksize=4):
             rows += n
             bad += not ok

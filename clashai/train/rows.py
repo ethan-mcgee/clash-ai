@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -121,7 +120,7 @@ def build(dataset: str, wait_keep: float, seed: int = 0, out_name: str | None = 
     rows = 0
     jobs = [(source / "battles" / f"{r['tag']}.npz", r, i, wait_keep, seed, header_fields)
             for i, r in enumerate(index)]
-    with ProcessPoolExecutor(max_workers=max(1, (os.cpu_count() or 2) // 2)) as pool:
+    with ProcessPoolExecutor(max_workers=max(1, paths.cpu_budget() // 2)) as pool:
         for k, part in enumerate(pool.map(_job, jobs, chunksize=8)):
             for name, f in files.items():
                 f.write(np.ascontiguousarray(part[name]).tobytes())

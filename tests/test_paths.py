@@ -30,3 +30,30 @@ def test_the_built_engine_matches_its_sources():
     marker = install / ".clashai-sources"
     if not os.environ.get("CLASHAI_CRFORGE_INSTALL"):
         assert marker.read_text().strip() == paths.engine_sources_hash()
+
+
+def test_the_cpu_budget_is_16_by_default_and_follows_the_setting(monkeypatch):
+    total = os.cpu_count()
+    monkeypatch.delenv("CLASHAI_MAX_THREADS", raising=False)
+    assert paths.cpu_budget() == min(16, total)
+    monkeypatch.setenv("CLASHAI_MAX_THREADS", "4")
+    assert paths.cpu_budget() == 4 and paths.default_threads() == 2
+    monkeypatch.setenv("CLASHAI_MAX_THREADS", "all")
+    assert paths.cpu_budget() == total
+    monkeypatch.setenv("CLASHAI_MAX_THREADS", "999")
+    assert paths.cpu_budget() == total
+
+
+def test_importing_clashai_confines_the_process_to_the_budget():
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    k = ctypes.WinDLL("kernel32")
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    k.GetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+                                         ctypes.POINTER(ctypes.c_size_t)]
+    process, system = ctypes.c_size_t(), ctypes.c_size_t()
+    assert k.GetProcessAffinityMask(k.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(system))
+    assert bin(process.value).count("1") == paths.cpu_budget()

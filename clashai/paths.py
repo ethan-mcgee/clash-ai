@@ -129,11 +129,62 @@ def ensure_java() -> Path:
     raise RuntimeError("no JDK 21 found: install Temurin 21 or set CLASHAI_JAVA_HOME")
 
 
-def default_threads() -> int:
-    """JVM threads for stepping battles: one per physical core.
+CPU_CAP = 16
+"""Logical processors the program may use unless ``CLASHAI_MAX_THREADS`` says otherwise: 16 of the
+7900X's 24 (8 of its 12 cores), leaving the rest of the machine free."""
 
-    Hyperthreads add little until batches are large (docs/SETUP.md), and the Python and GPU side
-    needs CPU too, so this halves the logical count: 12 on the 7900X. Pass ``threads`` explicitly
-    to use all 24 for engine-only work such as replay conversion.
+_THREAD_POOLS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def cpu_budget() -> int:
+    """Logical processors this program uses: ``CLASHAI_MAX_THREADS`` (``all`` or 0 for every one),
+    else :data:`CPU_CAP`, never more than the machine has."""
+    total = os.cpu_count() or 1
+    value = os.environ.get("CLASHAI_MAX_THREADS", str(CPU_CAP)).strip().lower()
+    if value in ("", "0", "all"):
+        return total
+    return max(1, min(total, int(value)))
+
+
+def apply_cpu_cap() -> int:
+    """Confines this process, and every process and thread it starts, to :func:`cpu_budget`
+    logical processors. Called when ``clashai`` is imported.
+
+    A CPU affinity mask is the hard cap: the operating system runs none of the process's threads
+    elsewhere, the JVM's (crforge runs inside this process) included, and child processes inherit
+    it. The first logical processors are taken; on the 7900X each core's two threads are adjacent,
+    so 16 logical processors are 8 whole cores. Thread
+    pools of the numeric libraries are sized to half the budget, one per core, so they do not
+    oversubscribe it; set before NumPy and PyTorch load.
     """
-    return max(1, (os.cpu_count() or 2) // 2)
+    n = cpu_budget()
+    for var in _THREAD_POOLS:
+        os.environ.setdefault(var, str(max(1, n // 2)))
+    total = os.cpu_count() or 1
+    if n < total:
+        # The JVM on Windows counts every processor despite the mask, and would size its garbage
+        # collector and compiler pools for all of them. Every JVM started from here (crforge's,
+        # inside this process, and Gradle's) reads this; it says "Picked up JAVA_TOOL_OPTIONS".
+        options = os.environ.get("JAVA_TOOL_OPTIONS", "")
+        if "ActiveProcessorCount" not in options:
+            os.environ["JAVA_TOOL_OPTIONS"] = f"{options} -XX:ActiveProcessorCount={n}".strip()
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+            kernel.SetProcessAffinityMask.restype = wintypes.BOOL
+            if not kernel.SetProcessAffinityMask(kernel.GetCurrentProcess(), (1 << n) - 1):
+                raise OSError(ctypes.get_last_error(), "could not set the CPU affinity")
+        elif hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, range(n))
+    return n
+
+
+def default_threads() -> int:
+    """JVM threads for stepping battles alongside the Python and GPU side: half the CPU budget,
+    one per core (8 under the default cap). Engine-only work (replay conversion, labelling) uses
+    the whole budget instead."""
+    return max(1, cpu_budget() // 2)

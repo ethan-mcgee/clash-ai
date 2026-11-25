@@ -6,6 +6,7 @@ How this project's Windows 11 machine runs crforge and trains on it. crforge's o
 
 - GPU: RTX 3090 Ti, 24 GB, NVIDIA driver 621.14
 - CPU: Ryzen 9 7900X, 12 cores / 24 threads, all enabled since 2026-11-24 (BIOS 4005; before that Windows saw 6 / 12). Code sizes thread counts from the machine, never a hard-coded number.
+- CPU cap: importing `clashai` confines the process to **16 logical processors (8 cores)** with a CPU affinity mask, so the rest of the machine stays free (`clashai.paths.apply_cpu_cap`). Everything it starts inherits the cap: crforge's JVM (told the same count with `-XX:ActiveProcessorCount`, so the console shows "Picked up JAVA_TOOL_OPTIONS"), worker processes, Gradle builds, PyTorch and NumPy (8 threads each). Engine-only work (conversion, labelling) uses all 16; the engine beside training uses 8. Set `CLASHAI_MAX_THREADS` to another number, or to `all`, to change it. Replay conversion runs as fast under the cap as on all 24 threads (61 s per 512 replays). crforge's own tools (`crforge-env-bench`, Gradle run directly) are not capped.
 - RAM: 64 GB
 - Disks: C: is nearly full, so everything large goes on **D:**
 

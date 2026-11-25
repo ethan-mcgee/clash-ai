@@ -141,6 +141,7 @@ def session(path: Path, device: str = "cuda"):
                  else ["CPUExecutionProvider"])
     options = ort.SessionOptions()
     options.log_severity_level = 3
+    options.intra_op_num_threads = max(1, paths.cpu_budget() // 2)  # within the CPU cap
     s = ort.InferenceSession(str(path), options, providers=providers)
     if device == "cuda" and "CUDAExecutionProvider" not in s.get_providers():
         # ONNX Runtime falls back to the CPU silently when its CUDA libraries do not load: 1.24.4

@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> None:
                 shutil.rmtree(raw)
             run = label_replays([source / "docs" / f"{r['tag']}.json" for r in chunk],
                                 paths.install_dir(), paths.tables_dir(), decision_ticks=5,
-                                threads=args.threads or paths.default_threads(),
+                                threads=args.threads or paths.cpu_budget(),
                                 check=args.check, out_dir=raw)
             if layout is None:
                 metadata = (raw / "metadata.json").read_text()
