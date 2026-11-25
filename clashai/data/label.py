@@ -5,14 +5,15 @@
 ``--resume`` skips the battles already in the dataset folder, so a conversion run that grew since it
 was last labelled costs only its new battles.
 
-Reads a conversion run's ``summary.jsonl``, keeps the battles that pass the quality filter, and
+Reads a conversion run's summaries (:func:`.convert.summary_files`), keeps the battles that pass the quality filter, and
 labels each: at every decision (5 ticks) of each seat, the observation and mask the environment
 shows that seat and the action that gives the player's command, or the wait. ``--check`` also
 drives each battle back from its labels alone; at 5-tick decisions it stops at the first command
 given between two decisions (driven up to 4 ticks early), so it proves little there.
 
 crforge writes about 54 MB of uncompressed rows a battle, so battles are labelled in chunks, each
-compacted (:mod:`.dataset`) and its raw rows deleted before the next. Writes
+compacted (:mod:`.dataset`, by ``--workers`` processes: one core would take as long as the engine's
+labelling) and its raw rows deleted before the next. Writes
 ``<data>/dataset/<run>-<filter>/``: ``battles/<tag>.npz``, crforge's ``metadata.json``,
 ``counts.jsonl``, and ``index.jsonl`` naming each battle's decks, slot flags, Piggies EQ seats,
 each seat's result and whether any deck is in the held-out split.
@@ -24,9 +25,11 @@ import argparse
 import json
 import shutil
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 
 from .. import paths
 from ..decks import PIGGIES_EQ, is_held_out
+from .convert import summary_files
 from .dataset import PART, Layout, compact
 
 FILTERS = {
@@ -65,14 +68,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--filter", choices=FILTERS, default="standard")
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--chunk", type=int, default=400, help="battles labelled at a time")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="processes compacting labelled battles; half the CPU budget by default")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--resume", action="store_true",
                         help="skip battles already labelled into the dataset folder")
     args = parser.parse_args(argv)
 
     source = paths.data_root() / "converted" / args.run
-    with open(source / "summary.jsonl", encoding="utf-8") as f:
-        rows = [json.loads(line) for line in f]
+    rows = []
+    for summary in summary_files(source):
+        with open(summary, encoding="utf-8") as f:
+            rows += [json.loads(line) for line in f]
     keep = [r for r in rows if not r["problem"] and FILTERS[args.filter](r)]
     out = paths.data_root() / "dataset" / f"{args.run}-{args.filter}"
     raw = paths.data_root() / "labelled" / f"{args.run}-{args.filter}-chunk"
@@ -92,7 +99,9 @@ def main(argv: list[str] | None = None) -> None:
     layout = None
     if args.resume and (out / "metadata.json").exists():
         layout = Layout.from_metadata(json.loads((out / "metadata.json").read_text()))
-    with open(out / "counts.jsonl", "a" if args.resume else "w", encoding="utf-8") as counts:
+    workers = args.workers or max(1, paths.cpu_budget() // 2)
+    with (open(out / "counts.jsonl", "a" if args.resume else "w", encoding="utf-8") as counts,
+          ProcessPoolExecutor(workers) as pool):
         for start in range(0, len(todo), args.chunk):
             chunk = todo[start:start + args.chunk]
             if raw.exists():
@@ -107,9 +116,10 @@ def main(argv: list[str] | None = None) -> None:
                 layout = Layout.from_metadata(json.loads(metadata))
             totals.update({k: v for k, v in run.totals().items() if isinstance(v, int)})
             counts.write((raw / "counts.jsonl").read_text())
-            for f in raw.glob("*.npz"):
-                tag = f.name.split("_docs_")[-1].removesuffix(".json.npz")
-                compact(f, out / "battles" / f"{tag}.npz", layout)
+            files = sorted(raw.glob("*.npz"))
+            targets = [out / "battles" / (f.name.split("_docs_")[-1].removesuffix(".json.npz") + ".npz")
+                       for f in files]
+            list(pool.map(compact, files, targets, [layout] * len(files)))
             shutil.rmtree(raw)
             print(f"{min(start + args.chunk, len(todo))}/{len(todo)} battles labelled", flush=True)
     with open(out / "index.jsonl", "w", encoding="utf-8") as f:
