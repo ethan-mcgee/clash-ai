@@ -2,6 +2,9 @@
 
     python -m clashai.data.label --run piggies_eq-screen-team0-v0-t0
 
+``--resume`` skips the battles already in the dataset folder, so a conversion run that grew since it
+was last labelled costs only its new battles.
+
 Reads a conversion run's ``summary.jsonl``, keeps the battles that pass the quality filter, and
 labels each: at every decision (5 ticks) of each seat, the observation and mask the environment
 shows that seat and the action that gives the player's command, or the wait. ``--check`` also
@@ -24,7 +27,7 @@ from collections import Counter
 
 from .. import paths
 from ..decks import PIGGIES_EQ, is_held_out
-from .dataset import Layout, compact
+from .dataset import PART, Layout, compact
 
 FILTERS = {
     "strict": lambda r: r["towers_exact"] and r["dropped"] == 0,
@@ -63,24 +66,35 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--chunk", type=int, default=400, help="battles labelled at a time")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip battles already labelled into the dataset folder")
     args = parser.parse_args(argv)
 
     source = paths.data_root() / "converted" / args.run
-    rows = [json.loads(line) for line in open(source / "summary.jsonl", encoding="utf-8")]
+    with open(source / "summary.jsonl", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f]
     keep = [r for r in rows if not r["problem"] and FILTERS[args.filter](r)]
     out = paths.data_root() / "dataset" / f"{args.run}-{args.filter}"
     raw = paths.data_root() / "labelled" / f"{args.run}-{args.filter}-chunk"
     (out / "battles").mkdir(parents=True, exist_ok=True)
-    print(f"{len(keep)} of {len(rows)} battles pass the '{args.filter}' filter", flush=True)
+    done = set()
+    if args.resume:
+        done = {f.name.removesuffix(".npz") for f in (out / "battles").glob("*.npz")
+                if not f.name.endswith(PART)}
+    todo = [r for r in keep if r["tag"] not in done]
+    print(f"{len(keep)} of {len(rows)} battles pass the '{args.filter}' filter; "
+          f"{len(keep) - len(todo)} labelled before", flush=True)
 
     paths.ensure_java()
     from crforge_env import label_replays
 
     totals: Counter = Counter()
     layout = None
-    with open(out / "counts.jsonl", "w", encoding="utf-8") as counts:
-        for start in range(0, len(keep), args.chunk):
-            chunk = keep[start:start + args.chunk]
+    if args.resume and (out / "metadata.json").exists():
+        layout = Layout.from_metadata(json.loads((out / "metadata.json").read_text()))
+    with open(out / "counts.jsonl", "a" if args.resume else "w", encoding="utf-8") as counts:
+        for start in range(0, len(todo), args.chunk):
+            chunk = todo[start:start + args.chunk]
             if raw.exists():
                 shutil.rmtree(raw)
             run = label_replays([source / "docs" / f"{r['tag']}.json" for r in chunk],
@@ -97,10 +111,9 @@ def main(argv: list[str] | None = None) -> None:
                 tag = f.name.split("_docs_")[-1].removesuffix(".json.npz")
                 compact(f, out / "battles" / f"{tag}.npz", layout)
             shutil.rmtree(raw)
-            print(f"{min(start + args.chunk, len(keep))}/{len(keep)} battles labelled", flush=True)
+            print(f"{min(start + args.chunk, len(todo))}/{len(todo)} battles labelled", flush=True)
     with open(out / "index.jsonl", "w", encoding="utf-8") as f:
-        for r in keep:
-            f.write(json.dumps(index_row(r)) + "\n")
+        f.writelines(json.dumps(index_row(r)) + "\n" for r in keep)
     print("totals:", json.dumps(dict(totals)))
     print(f"written to {out}")
 

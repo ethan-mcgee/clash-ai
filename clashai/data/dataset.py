@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ from pathlib import Path
 import numpy as np
 
 from .. import paths
+
+PART = ".part.npz"  # a battle being written
 
 
 @dataclass(frozen=True)
@@ -51,11 +54,15 @@ def compact(source: Path, target: Path, layout: Layout) -> int:
     counts = header[:, layout.entity_count].astype(np.int64)
     table = obs[:, layout.header_ints:].reshape(rows, layout.max_entities, layout.entity_ints)
     used = np.arange(layout.max_entities)[None, :] < counts[:, None]
+    # Written beside the target and renamed into place, so an interrupted run never leaves a
+    # partial battle under the target's name.
+    part = target.with_name(target.name.removesuffix(".npz") + PART)
     np.savez_compressed(
-        target, header=header, entities=table[used],
+        part, header=header, entities=table[used],
         offsets=np.concatenate([[0], np.cumsum(counts)]),
         masks=np.packbits(z["masks"], axis=1), actions=z["actions"], ticks=z["ticks"],
         seats=z["seats"].astype(np.int8), flags=z["flags"])
+    os.replace(part, target)
     return rows
 
 
