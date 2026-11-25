@@ -1,7 +1,7 @@
 """PPO for the Piggies EQ seat, against a league of opponent decks, anchored to imitation.
 
-    python -m clashai.train.ppo --name ppo1 --hours 8
-    python -m clashai.train.ppo --name ppo1 --resume --hours 8      # carries on a stopped run
+    python -m clashai.train.ppo --name ppo2 --hours 3
+    python -m clashai.train.ppo --name ppo2 --resume --hours 8      # carries on a stopped run
 
 The learner starts from an imitation checkpoint (``--init``, the generalist) and plays Piggies EQ
 from a random seat in ``--envs`` battles at once. Every game draws its opponent:
@@ -14,20 +14,31 @@ from a random seat in ``--envs`` battles at once. Every game draws its opponent:
 
 Each decision's reward is the game's result at its end (+1, -1, 0 for a draw) plus potential-based
 shaping, ``gamma * phi(next) - phi(now)`` with ``phi = --shaping * (own tower share - enemy tower
-share)`` and ``phi = 0`` at the end, which changes no optimal policy. The loss is PPO's clipped
-surrogate, a value loss, a small entropy bonus, and ``--kl-coef`` times the KL divergence to the
-reference network on the learner's own decisions, which keeps its play near human play. The first
-``--critic-warmup`` iterations train the value alone, while the policy waits for a usable critic.
+share)`` and ``phi = 0`` at the end, which changes no optimal policy.
+
+The critic is a network of its own (``--critic-init``), so its errors never reach the policy's
+features; it values every decision of a rollout in one pass after it. The first
+``--critic-warmup`` iterations train the critic alone, the policy frozen, so it learns the value of
+the learner's own games before it steers anything. The policy's loss is PPO's clipped surrogate, a
+small entropy bonus, and a weight times the KL divergence to the reference network on the
+learner's own decisions, which keeps its play near human play; the weight is adjusted each
+iteration to hold that divergence near ``--kl-target``.
+
+Every ``--eval-every`` iterations after the warm-up, the snapshot plays a short scorecard
+(``--eval-seeds`` seeds against each reference deck, piloted by the reference), and the best is
+copied to ``best.pt``: the training
+score drifts with the league's draws, the scorecard does not.
 
 A run writes ``<runs>/ppo/<name>/``: ``last.pt`` (with the optimiser and the league, to resume),
-``pool/iter_NNNNN.pt`` every ``--snapshot-every`` iterations (playable by the scorecard), and
-``metrics.jsonl``, one line an iteration.
+``pool/iter_NNNNN.pt`` every ``--snapshot-every`` iterations (playable by the scorecard),
+``best.pt``, ``metrics.jsonl`` (one line an iteration) and ``evals.jsonl`` (one per scorecard).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -172,37 +183,102 @@ class Pilots:
         return self.nets[path]
 
 
+def adapt_kl(coef: float, kl: float, target: float, low: float = 1e-3, high: float = 10.0) -> float:
+    """The KL weight for the next iteration: raised by half when the drift ``kl`` is past 1.5
+    times ``target``, lowered by a third when it is under half of it. A target of 0 keeps it."""
+    if target <= 0:
+        return coef
+    if kl > 1.5 * target:
+        coef *= 1.5
+    elif kl < 0.5 * target:
+        coef /= 1.5
+    return float(min(max(coef, low), high))
+
+
+def game_outcomes(dones: np.ndarray, results: np.ndarray) -> np.ndarray:
+    """Each row's game result, read back from the step its game ended (``results`` holds the
+    result on ``dones`` rows); NaN for a game still going at the end of the rollout."""
+    out = np.full(dones.shape, np.nan, np.float32)
+    carry = np.full(dones.shape[1], np.nan, np.float32)
+    for t in range(len(dones) - 1, -1, -1):
+        carry = np.where(dones[t] > 0, results[t], carry)
+        out[t] = carry
+    return out
+
+
+class Evaluator:
+    """A short scorecard: Piggies EQ, piloted by a checkpoint, against every reference deck
+    piloted by the reference network, on fixed seeds, 2 games each (both seats)."""
+
+    def __init__(self, reference_path: str, seeds: int, threads: int | None):
+        from ..model.policy import NetPolicy
+
+        self.opponent = NetPolicy(reference_path, name="reference")
+        self.seeds = list(range(EVAL_SEEDS[0], EVAL_SEEDS[0] + seeds))
+        self.threads = threads
+
+    def __call__(self, checkpoint: str) -> dict:
+        from ..decks import REFERENCE_DECKS
+        from ..eval.arena import Side, play
+        from ..model.policy import NetPolicy
+
+        policy = NetPolicy(checkpoint, name="learner")
+        by_deck = {}
+        for name, d in REFERENCE_DECKS.items():
+            games = play(Side(policy, PIGGIES_EQ), Side(self.opponent, d), self.seeds,
+                         threads=self.threads)
+            by_deck[name] = float(np.mean([g.score for g in games]))
+        del policy
+        torch.cuda.empty_cache()
+        return {"score": float(np.mean(list(by_deck.values()))), "by_deck": by_deck,
+                "games": len(by_deck) * 2 * len(self.seeds)}
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="PPO for Piggies EQ against a league")
     p.add_argument("--name", required=True)
     p.add_argument("--init", help=f"checkpoint to start from (default <runs>/{DEFAULT_INIT})")
+    p.add_argument("--critic-init",
+                   help="checkpoint the critic starts from (default: --init's), such as one whose "
+                        "value head was fitted with bc --value-only")
     p.add_argument("--reference", help="the frozen pilot and KL anchor (default: --init's)")
     p.add_argument("--resume", action="store_true", help="carry on from the run's last.pt")
     p.add_argument("--iters", type=int, default=100000)
     p.add_argument("--hours", type=float, default=0, help="stop after this long (0: never)")
-    p.add_argument("--envs", type=int, default=512)
+    p.add_argument("--envs", type=int, default=1024)
     p.add_argument("--steps", type=int, default=128, help="decisions per battle an iteration")
-    p.add_argument("--epochs", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--minibatch", type=int, default=1024)
-    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--lr", type=float, default=3e-6)
+    p.add_argument("--critic-lr", type=float, default=3e-5)
     p.add_argument("--gamma", type=float, default=0.998)
     p.add_argument("--lam", type=float, default=0.95)
     p.add_argument("--clip", type=float, default=0.2)
-    p.add_argument("--vf-coef", type=float, default=0.5)
-    p.add_argument("--value-trunk-grad", type=float, default=0.1,
-                   help="scale of the value loss's gradient into the shared trunk")
     p.add_argument("--ent-coef", type=float, default=0.001)
-    p.add_argument("--kl-coef", type=float, default=0.05)
+    p.add_argument("--kl-coef", type=float, default=0.1, help="the KL weight's starting value")
+    p.add_argument("--kl-target", type=float, default=0.01,
+                   help="the drift from the reference the KL weight is adjusted to hold (0: fixed)")
+    p.add_argument("--kl-min", type=float, default=0.02,
+                   help="the KL weight's floor: the learner starts equal to the reference, so its "
+                        "drift reads 0 at first, and an unbounded weight would fall far meanwhile")
     p.add_argument("--shaping", type=float, default=0.5)
-    p.add_argument("--critic-warmup", type=int, default=5)
+    p.add_argument("--critic-warmup", type=int, default=30,
+                   help="iterations at the start that train the critic alone, the policy frozen")
     p.add_argument("--mirror-share", type=float, default=0.1)
     p.add_argument("--hard-share", type=float, default=0.5,
                    help="share of games drawn toward lost matchups (the rest by replay frequency)")
     p.add_argument("--snapshot-every", type=int, default=20)
+    p.add_argument("--eval-seeds", type=int, default=20,
+                   help="seeds per reference deck for the in-run scorecard (0: none)")
+    p.add_argument("--eval-every", type=int, default=40,
+                   help="iterations between in-run scorecards, a multiple of --snapshot-every "
+                        "(each takes about 8-10 minutes at 20 seeds)")
     p.add_argument("--pool", type=int, default=5, help="recent snapshots the mirror games draw on")
     p.add_argument("--threads", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.eval_seeds and args.eval_every % args.snapshot_every:
+        raise SystemExit("--eval-every must be a multiple of --snapshot-every: it scores snapshots")
 
     out_dir = paths.runs_dir() / "ppo" / args.name
     (out_dir / "pool").mkdir(parents=True, exist_ok=True)
@@ -215,27 +291,40 @@ def main(argv: list[str] | None = None) -> None:
 
     resume = torch.load(out_dir / "last.pt", map_location=device, weights_only=False) \
         if args.resume else None
+    if resume and "critic" not in resume:
+        raise SystemExit("this run was made before the separate critic; start a new --name")
     init = Path(args.init) if args.init else paths.runs_dir() / DEFAULT_INIT
     reference_path = str(args.reference or (resume["reference"] if resume else init))
     net, init_ckpt = load_net(init, device)
     metadata = init_ckpt.get("metadata")
     net.set_dropout(0.0)  # rollout and update must see the same policy
+    critic_net, _ = load_net(Path(args.critic_init) if args.critic_init else init, device)
+    critic_net.set_dropout(0.0)
     if resume:
         net.load_state_dict(resume["model"])
+        critic_net.load_state_dict(resume["critic"])
     net.train()
+    critic_net.train()
     spec, k = net.spec, net.config.max_entities
     pilots = Pilots(device, args.pool + 1)
     reference = pilots.get(reference_path)
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-5,
                             weight_decay=0.0)
+    critic_opt = torch.optim.AdamW(critic_net.parameters(), lr=args.critic_lr,
+                                   betas=(0.9, 0.999), eps=1e-5, weight_decay=0.0)
     decks, held = opponent_decks()
     league = League(decks, uniform=1 - args.hard_share)
     start_iter = 0
+    kl_coef = args.kl_coef
+    best_eval = -1.0
     if resume:
         opt.load_state_dict(resume["optimizer"])
+        critic_opt.load_state_dict(resume["critic_optimizer"])
         league.load_state_dict(resume["league"])
         start_iter = resume["iteration"] + 1
+        kl_coef = resume["kl_coef"]
+        best_eval = resume.get("best_eval", -1.0)
     pool = sorted(str(f) for f in (out_dir / "pool").glob("iter_*.pt"))
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=1))
     print(f"{len(decks)} opponent decks ({sum(d.met for d in decks):,} games in the replays; "
@@ -248,6 +337,7 @@ def main(argv: list[str] | None = None) -> None:
     v.set_autoreset_seeds(EVAL_SEEDS[1] + 1, 2**31 - 1)
     slot_evo = s.slot_evolution
     piggies_slots = PIGGIES_EQ.slots(slot_evo)
+    evaluator = Evaluator(reference_path, args.eval_seeds, args.threads) if args.eval_seeds else None
 
     # Each battle's current game: the learner's seat, its opponent and how it was drawn.
     seat = rng.integers(0, 2, n)
@@ -295,10 +385,13 @@ def main(argv: list[str] | None = None) -> None:
         "ref_logp": np.zeros((steps, n), np.float32),
         "values": np.zeros((steps, n), np.float32),
         "rewards": np.zeros((steps, n), np.float32),
+        "results": np.zeros((steps, n), np.float32),
+        "phi": np.zeros((steps, n), np.float32),
         "dones": np.zeros((steps, n), np.float32),
         "live": np.zeros((steps, n), bool),
     }
     log = open(out_dir / "metrics.jsonl", "a", encoding="utf-8")
+    evals = open(out_dir / "evals.jsonl", "a", encoding="utf-8")
     t_start = time.time()
     arange = np.arange(n)
 
@@ -308,12 +401,35 @@ def main(argv: list[str] | None = None) -> None:
             out = model(h, e, valid)
         return out
 
+    @torch.no_grad()
+    def values_of(obs: np.ndarray) -> np.ndarray:
+        """The critic's values of ``(B, seat_ints)`` observations, in batches."""
+        out = np.zeros(len(obs), np.float32)
+        for a in range(0, len(obs), 4096):
+            o = forward(critic_net, obs[a:a + 4096])
+            out[a:a + 4096] = (o["value"].float() * value_scale).cpu().numpy()
+        return out
+
+    def run_eval(label: str, checkpoint: str, it: int) -> float:
+        t = time.time()
+        r = evaluator(checkpoint)
+        evals.write(json.dumps({"iteration": it, "checkpoint": label, **r}) + "\n")
+        evals.flush()
+        worst = sorted(r["by_deck"].items(), key=lambda kv: kv[1])[:3]
+        print(f"  scorecard {label}: {r['score']:.3f} over {r['games']} games "
+              f"(weakest: {', '.join(f'{d} {x:.0%}' for d, x in worst)}) [{time.time() - t:.0f} s]",
+              flush=True)
+        return r["score"]
+
     try:
+        if evaluator and start_iter == 0:
+            run_eval("start", str(init), -1)
         for it in range(start_iter, args.iters):
             t0 = time.time()
+            warm = it < args.critic_warmup
             league_probs[0] = league.probabilities()
             net.eval()
-            finished = []  # (score, deck, weight) of the league games, mirror games apart
+            finished = []  # (score, deck, weight, ticks) of the league games, mirror games apart
             mirror_scores = []
             plays = 0
             for t in range(steps):
@@ -327,7 +443,6 @@ def main(argv: list[str] | None = None) -> None:
                     out = forward(net, own)
                     m = torch.from_numpy(own_mask).to(device)
                     actions, logp = sample(net, out, m, gen)
-                    values = out["value"].float() * value_scale
                     # The reference pilots its opponents and scores the learner's actions in one
                     # forward pass.
                     ref_rows = np.flatnonzero([pl == reference_path for pl in pilot])
@@ -356,9 +471,9 @@ def main(argv: list[str] | None = None) -> None:
                 buf["actions"][t] = acts
                 buf["logp"][t] = logp.cpu().numpy()
                 buf["ref_logp"][t] = ref_logp.float().cpu().numpy()
-                buf["values"][t] = values.cpu().numpy()
                 buf["live"][t] = ~restarting
                 phi_now = tower_potential(own[:, :hi], spec, args.shaping)
+                buf["phi"][t] = phi_now
                 both_actions = np.zeros((n, 2), np.int32)
                 both_actions[arange, seat] = acts
                 both_actions[arange, 1 - seat] = opp_actions
@@ -373,6 +488,7 @@ def main(argv: list[str] | None = None) -> None:
                 faulted = v.infos[:, s.info["fault"]] != 0
                 shaped = reward + args.gamma * phi_next - phi_now
                 buf["rewards"][t] = np.where(restarting | (dones & faulted), 0.0, shaped)
+                buf["results"][t] = np.where(dones & ~faulted, reward, 0.0)
                 buf["dones"][t] = dones
                 # Battles restarted by this step start the game drawn for them.
                 for i in np.flatnonzero(restarting):
@@ -397,19 +513,30 @@ def main(argv: list[str] | None = None) -> None:
                     restarting[i] = True
             rollout_s = time.time() - t0
 
-            with torch.no_grad():
-                last_values = (forward(net, v.observations[arange, seat])["value"].float()
-                               * value_scale).cpu().numpy()
+            # The critic values every row in one pass, and the battles as the rollout leaves them.
+            flat = {key: val.reshape(steps * n, *val.shape[2:]) for key, val in buf.items()}
+            obs_flat = np.concatenate([flat["header"], flat["entities"]], 1)
+            buf["values"][:] = values_of(obs_flat).reshape(steps, n)
+            last_values = values_of(v.observations[arange, seat])
             adv, ret = gae(buf["rewards"], buf["values"], buf["dones"], buf["live"],
                            last_values, args.gamma, args.lam)
+
+            # How well the critic foresees the result: its value less the shaping still to come
+            # (the potential, which the returns pay back) is its estimate of the result.
+            outcome = game_outcomes(buf["dones"], buf["results"])
+            known = buf["live"] & ~np.isnan(outcome)
+            win_pred = (buf["values"] + buf["phi"])[known]
+            result_known = outcome[known]
+            decided = result_known != 0
+            win_sign = float(((win_pred > 0) == (result_known > 0))[decided].mean()) \
+                if decided.any() else None
+            win_mse = float(((win_pred - result_known) ** 2).mean()) if known.any() else None
 
             # -- update --
             t1 = time.time()
             net.train()
             idx_all = np.flatnonzero(buf["live"].ravel())
-            flat = {key: val.reshape(steps * n, *val.shape[2:]) for key, val in buf.items()}
             adv_f, ret_f = adv.ravel(), ret.ravel()
-            warm = it < args.critic_warmup
             stats: dict = {}
             for _ in range(args.epochs):
                 order = rng.permutation(idx_all)
@@ -417,49 +544,51 @@ def main(argv: list[str] | None = None) -> None:
                     idx = np.sort(order[start:start + args.minibatch])
                     if len(idx) < args.minibatch // 4:
                         continue
-                    obs = np.concatenate([flat["header"][idx], flat["entities"][idx]], 1)
-                    h, e, valid = seat_inputs(obs, spec, k, device)
-                    mask = unpack_masks(torch.from_numpy(flat["masks"][idx]).to(device),
-                                        spec.actions)
-                    acts_t = torch.from_numpy(flat["actions"][idx]).to(device)
-                    old = torch.from_numpy(flat["logp"][idx]).to(device)
-                    ref = torch.from_numpy(flat["ref_logp"][idx]).to(device)
-                    a = torch.from_numpy(adv_f[idx]).to(device)
-                    a = (a - a.mean()) / (a.std() + 1e-8)
+                    h, e, valid = seat_inputs(obs_flat[idx], spec, k, device)
                     target = torch.from_numpy(ret_f[idx]).to(device)
                     with torch.autocast("cuda", dtype=torch.bfloat16):
-                        o = net(h, e, valid)
-                        logp, entropy = evaluate_actions(net, o, mask, acts_t)
-                        value = critic(net, o, args.value_trunk_grad) * value_scale
-                    ratio = torch.exp(logp - old)
-                    pg = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
-                    d = ref - logp
-                    kl_ref = (torch.exp(d) - d - 1).mean()
+                        value = critic(critic_net, critic_net(h, e, valid), 1.0) * value_scale
                     v_loss = F.mse_loss(value, target)
-                    ent = entropy.mean()
-                    if warm:
-                        loss = args.vf_coef * v_loss
-                    else:
-                        loss = pg + args.vf_coef * v_loss - args.ent_coef * ent \
-                            + args.kl_coef * kl_ref
-                    opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-                    if warm:  # the policy's own heads stay as they are
-                        for name, prm in net.named_parameters():
-                            if not name.startswith("value_head.") and prm.grad is not None:
-                                prm.grad = None
-                    opt.step()
+                    critic_opt.zero_grad(set_to_none=True)
+                    v_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(critic_net.parameters(), 0.5)
+                    critic_opt.step()
+                    batch_stats = {"value_loss": v_loss}
+                    if not warm:
+                        mask = unpack_masks(torch.from_numpy(flat["masks"][idx]).to(device),
+                                            spec.actions)
+                        acts_t = torch.from_numpy(flat["actions"][idx]).to(device)
+                        old = torch.from_numpy(flat["logp"][idx]).to(device)
+                        ref = torch.from_numpy(flat["ref_logp"][idx]).to(device)
+                        a = torch.from_numpy(adv_f[idx]).to(device)
+                        a = (a - a.mean()) / (a.std() + 1e-8)
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            logp, entropy = evaluate_actions(net, net(h, e, valid), mask, acts_t)
+                        ratio = torch.exp(logp - old)
+                        pg = -torch.min(ratio * a,
+                                        ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
+                        d = ref - logp
+                        kl_ref = (torch.exp(d) - d - 1).mean()
+                        ent = entropy.mean()
+                        loss = pg - args.ent_coef * ent + kl_coef * kl_ref
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                        opt.step()
+                        batch_stats.update({
+                            "policy_loss": pg, "entropy": ent, "kl_ref": kl_ref,
+                            "approx_kl": (old - logp).mean(),
+                            "clip_frac": ((ratio - 1).abs() > args.clip).float().mean()})
                     with torch.no_grad():
-                        for key, val in (("policy_loss", pg), ("value_loss", v_loss),
-                                         ("entropy", ent), ("kl_ref", kl_ref),
-                                         ("approx_kl", (old - logp).mean()),
-                                         ("clip_frac", ((ratio - 1).abs() > args.clip).float().mean())):
+                        for key, val in batch_stats.items():
                             stats[key] = stats.get(key, 0.0) + float(val)
                         stats["_n"] = stats.get("_n", 0) + 1
             update_s = time.time() - t1
             nb = max(1, stats.pop("_n", 1))
             stats = {key: val / nb for key, val in stats.items()}
+            used_kl_coef = kl_coef
+            if not warm:
+                kl_coef = adapt_kl(kl_coef, stats["kl_ref"], args.kl_target, low=args.kl_min)
             live = buf["live"]
             var = float(np.var(ret[live]))
             ev = 1 - float(np.var(ret[live] - buf["values"][live])) / var if var > 0 else 0.0
@@ -475,7 +604,8 @@ def main(argv: list[str] | None = None) -> None:
                 "mirror_score": float(np.mean(mirror_scores)) if mirror_scores else None,
                 "game_seconds": float(np.mean([f[3] for f in finished]) / 20) if finished else None,
                 "plays_per_minute": plays / max(1, int(live.sum())) * 240,
-                "explained_variance": ev, "warmup": warm,
+                "explained_variance": ev, "result_sign_acc": win_sign, "result_mse": win_mse,
+                "kl_coef": used_kl_coef, "warmup": warm,
                 "rollout_s": round(rollout_s, 1), "update_s": round(update_s, 1), **stats,
             }
             log.write(json.dumps(row) + "\n")
@@ -483,15 +613,19 @@ def main(argv: list[str] | None = None) -> None:
             fmt = lambda x, f="{:.3f}": "-" if x is None else f.format(x)
             print(f"iter {it}: {len(finished)} games, score {fmt(row['score'])} "
                   f"(by frequency {fmt(row['score_by_frequency'])}), mirror "
-                  f"{fmt(row['mirror_score'])} of {len(mirror_scores)}; kl_ref "
-                  f"{stats.get('kl_ref', 0):.4f}, approx_kl {stats.get('approx_kl', 0):.4f}, clip "
-                  f"{stats.get('clip_frac', 0):.3f}, value loss {stats.get('value_loss', 0):.4f}, "
-                  f"ev {ev:.2f}, entropy {stats.get('entropy', 0):.3f}"
-                  f"{' [critic warm-up]' if warm else ''} "
-                  f"[{rollout_s:.0f}+{update_s:.0f} s, {row['minutes']} min]", flush=True)
+                  f"{fmt(row['mirror_score'])} of {len(mirror_scores)}; critic: value loss "
+                  f"{stats.get('value_loss', 0):.4f}, ev {ev:.2f}, result sign "
+                  f"{fmt(win_sign, '{:.0%}')}, result mse {fmt(win_mse)}"
+                  + (" [critic warm-up]" if warm else
+                     f"; policy: kl_ref {stats['kl_ref']:.4f} (weight {used_kl_coef:.3g}), "
+                     f"approx_kl {stats['approx_kl']:.4f}, clip {stats['clip_frac']:.3f}, "
+                     f"entropy {stats['entropy']:.3f}")
+                  + f" [{rollout_s:.0f}+{update_s:.0f} s, {row['minutes']} min]", flush=True)
 
             state = {"model": net.state_dict(), "description": net.describe(), "step": it,
                      "metadata": metadata, "optimizer": opt.state_dict(),
+                     "critic": critic_net.state_dict(), "critic_optimizer": critic_opt.state_dict(),
+                     "kl_coef": kl_coef, "best_eval": best_eval,
                      "league": league.state_dict(), "iteration": it, "reference": reference_path,
                      "args": vars(args)}
             torch.save(state, out_dir / "last.pt")
@@ -503,11 +637,19 @@ def main(argv: list[str] | None = None) -> None:
                 hard = ", ".join(f"{'/'.join(d.cards[:2])} {rate:.0%}"
                                  for d, rate, _ in league.hardest(5))
                 print(f"  snapshot {snap.name}; hardest matchups drawn more: {hard}", flush=True)
+                if evaluator and not warm and (it + 1) % args.eval_every == 0:
+                    score = run_eval(snap.name, str(snap), it)
+                    if score > best_eval:
+                        best_eval = score
+                        shutil.copyfile(snap, out_dir / "best.pt")
+                        print(f"  best so far: {snap.name} -> best.pt", flush=True)
+                    torch.save({**state, "best_eval": best_eval}, out_dir / "last.pt")
             if args.hours and time.time() - t_start > args.hours * 3600:
                 print(f"stopping: {args.hours} h reached", flush=True)
                 break
     finally:
         log.close()
+        evals.close()
         v.close()
     print(f"done; checkpoints in {out_dir}")
 

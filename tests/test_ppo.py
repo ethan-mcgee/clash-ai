@@ -28,6 +28,29 @@ def test_gae_matches_a_hand_computation_and_cuts_at_episode_ends():
     np.testing.assert_allclose(ret, adv + values)
 
 
+def test_the_kl_weight_rises_above_the_target_falls_below_it_and_holds_between():
+    from clashai.train.ppo import adapt_kl
+
+    assert adapt_kl(0.1, 0.03, 0.01) == pytest.approx(0.15)
+    assert adapt_kl(0.1, 0.004, 0.01) == pytest.approx(0.1 / 1.5)
+    assert adapt_kl(0.1, 0.012, 0.01) == 0.1
+    assert adapt_kl(0.1, 0.5, 0.0) == 0.1  # no target: fixed
+    assert adapt_kl(9.0, 1.0, 0.01) == 10.0 and adapt_kl(0.001, 0.0, 0.01) == 0.001
+
+
+def test_game_outcomes_reach_back_to_each_games_rows_and_leave_unfinished_games_unknown():
+    from clashai.train.ppo import game_outcomes
+
+    # Battle 0: a game lost at step 1, the restart at 2, then a game still going.
+    # Battle 1: a game won at step 3.
+    dones = np.array([[0, 0], [1, 0], [0, 0], [0, 1]], np.float32)
+    results = np.array([[0, 0], [-1, 0], [0, 0], [0, 1]], np.float32)
+    out = game_outcomes(dones, results)
+    np.testing.assert_array_equal(out[:2, 0], [-1, -1])
+    assert np.isnan(out[2:, 0]).all()
+    np.testing.assert_array_equal(out[:, 1], [1, 1, 1, 1])
+
+
 @pytest.fixture(scope="module")
 def spec_and_batch():
     from clashai.model.spec import Spec
