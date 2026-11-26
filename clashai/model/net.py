@@ -21,6 +21,12 @@ Optional, off in older checkpoints (each a :class:`Config` field):
   small network of its own. Its last layer starts at zero, so a new model starts as without it.
 - ``relations``: each layer adds a learned per-head bias where one unit targets the other, and
   another where it is targeted by it (an entity's ``target`` is the other's ``id``).
+- ``lstm``: a recurrent core after the trunk. Its input is the match token (with ``prev_action``,
+  joined by the seat's own previous action, the card it played and how long ago it last acted;
+  :mod:`clashai.model.memory`). Its output is added to the match, hand and ability tokens, so
+  every head reads it; the value head reads it too (the trainer detaches it). Such a model is
+  called with ``memory`` (see :meth:`PolicyNet.heads`) and runs its heads in fp32, since its
+  state is carried over a whole battle.
 
 Every amount is scaled here from crforge's integers, so the model takes the raw observation.
 """
@@ -34,6 +40,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from . import memory as mem
 from .spec import Spec
 
 TOWERS = [f"{who}_{t}_{k}" for who in ("own", "enemy") for t in ("king", "left", "right")
@@ -58,6 +65,8 @@ class Config:
     dropout: float = 0.0  # in the trunk's attention and feed-forward layers, while training
     attn_bias: bool = False  # a bias on unit-to-unit attention from their positions
     relations: bool = False  # a bias on unit-to-unit attention where one targets the other
+    lstm: int = 0  # width of a recurrent core after the trunk (0: none)
+    prev_action: bool = False  # the core also reads the seat's own previous action
 
 
 PAIR_FEATURES = 8
@@ -137,6 +146,22 @@ class PolicyNet(nn.Module):
                 nn.init.zeros_(mlp[2].bias)
         if self.config.relations:
             self.relation_bias = nn.Parameter(torch.zeros(layers, 2, heads))
+        if self.config.prev_action and not self.config.lstm:
+            raise ValueError("prev_action feeds the recurrent core: it needs lstm > 0")
+        if self.config.lstm:
+            h = self.config.lstm
+            if self.config.prev_action:
+                self.prev_kind = nn.Embedding(5, d)  # first decision, wait, play, ability, unknown
+                self.prev_tile = nn.Linear(2, d)
+                self.prev_since = nn.Embedding(mem.SINCE_BUCKETS, d)
+            self.core_in = nn.Sequential(nn.Linear(2 * d if self.config.prev_action else d, h),
+                                         nn.GELU())
+            self.core = nn.LSTM(h, h, batch_first=True)
+            with torch.no_grad():  # forget gate bias 1: remember by default at the start
+                self.core.bias_ih_l0[h:2 * h].fill_(1.0)
+                self.core.bias_hh_l0[h:2 * h].zero_()
+            self.core_out = nn.Linear(h, 3 * d)
+            self.core_norm = nn.ModuleList(nn.LayerNorm(d) for _ in range(3))
 
     def set_dropout(self, p: float) -> None:
         """Change the trunk's dropout, for a run that starts from another run's checkpoint."""
@@ -264,9 +289,11 @@ class PolicyNet(nn.Module):
     are then exact enough to rank, which matters when sampling sharpened or taking the most likely
     card and tile. Not part of the configuration: a play-time choice (NetPolicy sets it)."""
 
-    def forward(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor) -> dict:
-        """header (B, header_ints) int, entities (B, N, entity_ints) int, valid (B, N) bool."""
-        return self.heads(self.encode(header, entities, valid))
+    def forward(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor,
+                memory: dict | None = None) -> dict:
+        """header (B, header_ints) int, entities (B, N, entity_ints) int, valid (B, N) bool;
+        ``memory`` for a recurrent model (:meth:`heads`)."""
+        return self.heads(self.encode(header, entities, valid), memory)
 
     def encode(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor) -> dict:
         """The tokens through the trunk: the trunk's normalised output with what the heads need."""
@@ -284,18 +311,87 @@ class PolicyNet(nn.Module):
         return {"trunk": self.norm_out(trunk), "fixed": fixed, "valid": valid,
                 "entity_tile": tile}
 
-    def heads(self, enc: dict) -> dict:
-        """Every head's output from :meth:`encode`'s."""
+    def heads(self, enc: dict, memory: dict | None = None) -> dict:
+        """Every head's output from :meth:`encode`'s.
+
+        A recurrent model (``lstm`` > 0) needs ``memory``. Its B rows are ``lanes`` sequences of
+        T = B / lanes consecutive decisions, lane-major (row = lane * T + t):
+
+        - ``lanes``: the number of sequences
+        - ``first`` (B,) bool: the decision starts a battle-seat; the state restarts from zero
+        - ``state``: (h, c), each (1, lanes, lstm), carried from before the first row; None for
+          zeros
+        - ``prev_action``, ``prev_card``, ``since`` (B,): with ``prev_action``, the seat's own
+          past (:mod:`clashai.model.memory`)
+
+        The output's ``state`` is the state after each lane's last row. Other models ignore
+        ``memory``.
+        """
         out, fixed = enc["trunk"], enc["fixed"]
         with self._head_precision(out) as out:
             match, hand, ability = out[:, 0], out[:, 1:5], out[:, fixed - 2:fixed]
+            state = None
+            if self.config.lstm:
+                if memory is None:
+                    raise ValueError("a recurrent model needs memory (see PolicyNet.heads)")
+                match, hand, ability, state = self._core(match, hand, ability, memory)
             type_logits = torch.cat([self.wait_head(match), self.slot_head(hand).squeeze(-1),
                                      self.ability_head(ability).squeeze(-1)], 1)
             return {"type_logits": type_logits,
                     "value": torch.tanh(self.value_head(match).squeeze(-1)),
                     "hand_belief": self.hand_belief(match), "next_belief": self.next_belief(match),
                     "match": match, "hand": hand, "entities": out[:, fixed:],
-                    "valid": enc["valid"], "entity_tile": enc["entity_tile"]}
+                    "valid": enc["valid"], "entity_tile": enc["entity_tile"], "state": state}
+
+    def _prev_embedding(self, memory: dict) -> torch.Tensor:
+        """(B, d): the seat's previous action, the card it played and how long since it acted."""
+        a = memory["prev_action"].long()
+        first_ability = self.spec.first_ability
+        kind = torch.full_like(a, 4)  # unknown
+        kind = torch.where(a == mem.NO_ACTION, torch.zeros_like(a), kind)
+        kind = torch.where(a == 0, torch.ones_like(a), kind)
+        play = (a > 0) & (a < first_ability)
+        kind = torch.where(play, torch.full_like(a, 2), kind)
+        kind = torch.where(a >= first_ability, torch.full_like(a, 3), kind)
+        tile = torch.where(play, (a - 1) % self.spec.tiles, torch.zeros_like(a))
+        xy = torch.stack([(tile % self.spec.cols + 0.5) / self.spec.cols,
+                          (torch.div(tile, self.spec.cols, rounding_mode="floor") + 0.5)
+                          / self.spec.rows], -1) * play[:, None]
+        card = torch.where(play, memory["prev_card"].long().clamp(-1, self.spec.vocab - 1) + 1,
+                           torch.zeros_like(a))
+        return (self.prev_kind(kind) + self.card(card) + self.prev_tile(xy)
+                + self.prev_since(mem.since_bucket(memory["since"].long(), a)))
+
+    def _core(self, match, hand, ability, memory: dict):
+        """The recurrent core over lane-major rows, restarting at each ``first``."""
+        x = match
+        if self.config.prev_action:
+            x = torch.cat([match, self._prev_embedding(memory).to(match.dtype)], -1)
+        x = self.core_in(x)
+        lanes = int(memory["lanes"])
+        n, width = x.shape
+        steps = n // lanes
+        x = x.view(lanes, steps, width)
+        first = memory["first"].view(lanes, steps)
+        if memory.get("state") is None:
+            h = x.new_zeros(1, lanes, width)
+            c = x.new_zeros(1, lanes, width)
+        else:
+            h, c = (s.to(x.dtype) for s in memory["state"])
+        # Run in segments, cut wherever some lane restarts, so a restart is always a segment's
+        # first step and nn.LSTM runs each segment whole.
+        cuts = [0, *(torch.nonzero(first[:, 1:].any(0)).squeeze(1) + 1).tolist(), steps]
+        ys = []
+        for a, b in zip(cuts[:-1], cuts[1:], strict=True):
+            keep = (~first[:, a]).to(x.dtype)[None, :, None]
+            y, (h, c) = self.core(x[:, a:b], (h * keep, c * keep))
+            ys.append(y)
+        y = torch.cat(ys, 1).reshape(n, width)
+        add = self.core_out(y).view(n, 3, -1)
+        match = self.core_norm[0](match + add[:, 0])
+        hand = self.core_norm[1](hand + add[:, 1, None])
+        ability = self.core_norm[2](ability + add[:, 2, None])
+        return match, hand, ability, (h, c)
 
     def _pairs(self, entities: torch.Tensor, valid: torch.Tensor) -> dict:
         """What every layer's attention bias reads, computed once in fp32: for each pair of units
@@ -338,8 +434,9 @@ class PolicyNet(nn.Module):
 
     @contextmanager
     def _head_precision(self, x: torch.Tensor):
-        """Yields ``x`` as is, or in fp32 with autocast off (:attr:`fp32_heads`)."""
-        if not self.fp32_heads:
+        """Yields ``x`` as is, or in fp32 with autocast off (:attr:`fp32_heads`, and always for a
+        recurrent model)."""
+        if not (self.fp32_heads or self.config.lstm):
             yield x
             return
         with torch.autocast(x.device.type, enabled=False):
