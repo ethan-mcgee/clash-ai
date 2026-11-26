@@ -369,6 +369,7 @@ class PolicyNet(nn.Module):
         if self.config.prev_action:
             x = torch.cat([match, self._prev_embedding(memory).to(match.dtype)], -1)
         x = self.core_in(x)
+        self.core.flatten_parameters()  # copies (the EMA's) leave cuDNN's weight block split
         lanes = int(memory["lanes"])
         n, width = x.shape
         steps = n // lanes

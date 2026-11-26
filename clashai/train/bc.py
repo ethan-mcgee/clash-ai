@@ -280,6 +280,12 @@ def evaluate(net, rows: Rows, indices: np.ndarray, *, policy_rows: str, loss_wei
             sums[k] = sums.get(k, 0.0) + v * len(b["actions"])
     n = len(indices)
     net.train()
+    return summary(sums, n)
+
+
+def summary(sums: dict, n: int) -> dict:
+    """Validation metrics from the sums of :func:`_metrics` (and the batch means of the losses,
+    each times its batch size) over ``n`` rows."""
     return {
         "loss": sums["loss"] / n, "policy_nll": sums["policy"] / n,
         "card_acc": sums["card_ok"] / max(1, sums["n_play"]),
