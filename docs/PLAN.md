@@ -156,18 +156,19 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
 - The run trains from scratch on every decision of the 125,612 battles of the `prefix` filter (`docs/DATA.md`), battle-seats × 32 decisions a step.
   - Model: 17.5M parameters, d 384, 6 layers, LSTM 512.
   - Every play and a seeded 10% of the waits train the trunk, the waits' gradient scaled ×10; the core and heads learn from every decision. Peak GPU memory fell from 14.6 GB to 3.5 GB at 64 lanes (6.5 GB at 128), and a chunk that still runs out is skipped.
-  - Measured while a labelling run shared the CPU: 6,200 rows/s at 64 lanes, 9,300 at 128. Each step has about 120 ms of fixed overhead (many small GPU launches), so wider steps run faster.
+  - Each step has about 120 ms of fixed overhead (many small GPU launches), so wider steps run faster: 6,200 rows/s at 64 lanes, 9,300 at 128 (both measured while labelling shared the CPU). On a clean machine at 128 lanes: 9,100 rows/s, 6.6 GB peak.
+  - 208.2M training decisions; 3 passes is about 152,500 steps: about 19 hours of training plus about 1 hour of validation.
   - 128 lanes × 32 decisions (4,096 rows, about 158 plays) a step; AdamW 3e-4 (square-root scaled from 2e-4 at 64 lanes), warm-up 1,500 steps, EMA 0.999 (the same window in rows as 0.9995 at 64 lanes), validation every 4,000 steps (about 95 s each).
   - Started hidden, it checkpoints every 15 minutes, and the same command resumes it after a stop or a reboot.
-- Baseline on the same whole-battle validator: generalist-v2 scores 0.2354 (gate 0.1190, card 0.0270, tile 0.0894, calibration 1.076), 0.0014 above its row validator. To be measured again on the prefix set's validation battles.
+- Baseline on the same whole-battle validator, the prefix set's 600 validation battle-seats (300 battles, 43 of them cut): generalist-v2 scores 0.2374 (gate 0.1201, card 0.0273, tile 0.0899, calibration 1.084), 0.0034 above its best on the row validator (0.2340).
 - Go/no-go at the validation nearest 4 hours. Continue only if all hold:
-  - the policy loss is no worse than generalist-v2's at the same number of play examples trained on (`plays_seen` in the metrics), plus the 0.0014 validator offset. generalist-v2 trained on 456 plays a step; its row-validator loss by plays seen:
+  - the policy loss is no worse than generalist-v2's at the same number of play examples trained on (`plays_seen` in the metrics), plus the 0.0034 validator offset. At 4 hours (about step 32,000, 5M plays) that is 0.2508 + 0.0034 ≈ 0.254. generalist-v2 trained on 456 plays a step; its row-validator loss by plays seen:
 
     | Plays seen | 2.5M | 5M | 10M | 20M | 30M | 40M |
     |---|---:|---:|---:|---:|---:|---:|
     | generalist-v2 | 0.2637 | 0.2508 | 0.2429 | 0.2371 | 0.2350 | 0.2339 |
 
-  - play-rate calibration no further from 1 than generalist-v2's (0.924–1.076);
+  - play-rate calibration no further from 1 than generalist-v2's (0.916–1.084);
   - zeroing the memory costs at least 0.002;
   - a 10-seed scorecard's median plays per minute within 20% of generalist-v2's at the same sampling.
 - Otherwise stop, and diagnose from the gate, card and tile split and the previous-action-hidden cost.
