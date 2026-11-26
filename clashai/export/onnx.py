@@ -89,6 +89,9 @@ def export(checkpoint: Path, out: Path, metadata: dict | None = None, deck: str 
     import onnx
 
     net, ckpt = load_net(checkpoint, "cpu")
+    if net.config.lstm:
+        raise ValueError("a recurrent model needs state inputs and outputs in the exported graph "
+                         "(a later export format); this format has none")
     metadata = metadata or ckpt.get("metadata")
     if metadata is None:
         raise SystemExit(f"{checkpoint} holds no schema metadata: pass --metadata <rows>/metadata.json")

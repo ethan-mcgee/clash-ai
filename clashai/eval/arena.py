@@ -61,6 +61,9 @@ def play_matches(matches: Sequence[tuple[Side, Side]], seeds: Sequence[int], *, 
     Each policy acts once per decision on all of its rows. Rows are grouped by role (A or B) and
     policy object, each group drawing from its own generator, so one match reproduces
     :func:`play`'s games exactly. With ``behaviour`` each game records side A's play.
+
+    A ``stateful`` policy (a recurrent network) is reset with the vector's size before each chunk
+    and told which seat each row is (``keys``: battle row * 2 + seat).
     """
     seeds = [int(seed) for seed in seeds]
     games = [(m, seed, seat) for m in range(len(matches)) for seed in seeds for seat in (0, 1)]
@@ -80,6 +83,7 @@ def play_matches(matches: Sequence[tuple[Side, Side]], seeds: Sequence[int], *, 
         info = s.info
         for policy in policies.values():
             policy.bind(v)
+        stateful = {key for key, policy in policies.items() if getattr(policy, "stateful", False)}
         tracker = None
         if behaviour:
             from .behaviour import Behaviour
@@ -104,6 +108,8 @@ def play_matches(matches: Sequence[tuple[Side, Side]], seeds: Sequence[int], *, 
                       else [side.setup for side in on[seat]] for seat in (0, 1)]
             v.reset([seed for _, seed, _ in chunk], decks[0], decks[1], slots[0], slots[1],
                     setups[0], setups[1])
+            for key in stateful:
+                policies[key].reset(n)
             finished = np.arange(n) >= real
             rngs = [np.random.default_rng([rng_seed, start, g]) for g in range(len(groups))]
             if tracker is not None:
@@ -117,8 +123,9 @@ def play_matches(matches: Sequence[tuple[Side, Side]], seeds: Sequence[int], *, 
                     if not len(rows):
                         continue
                     seat = role_seat[role, rows]
+                    extra = {"keys": rows * 2 + seat} if key in stateful else {}
                     actions[rows, seat] = policies[key].act(v.observations[rows, seat],
-                                                            v.masks[rows, seat], rngs[g])
+                                                            v.masks[rows, seat], rngs[g], **extra)
                 if tracker is not None:
                     seat = role_seat[0, live]
                     tracker.add(live, v.observations[live, seat, :hi], actions[live, seat])

@@ -68,3 +68,16 @@ def test_a_model_with_attention_biases_exports_and_matches_pytorch(tmp_path):
     path = export(ckpt, tmp_path / "biased.onnx", example=(obs[:4], masks[:4]))
     d = compare(path, ckpt, obs, masks, device="cpu")
     assert d["first_logp"] < 1e-4 and d["tile_logp"] < 1e-4 and d["value"] < 1e-4
+
+
+def test_a_recurrent_model_is_refused_rather_than_exported_without_its_state(tmp_path):
+    from clashai.export.onnx import export
+
+    metadata = json.loads((ROWS / "metadata.json").read_text())
+    net = PolicyNet(Spec.from_metadata(metadata), Config(d=64, layers=2, heads=4,
+                                                         grid_channels=16, lstm=32))
+    ckpt = tmp_path / "recurrent.pt"
+    torch.save({"model": net.state_dict(), "description": net.describe(), "step": 0,
+                "metadata": metadata}, ckpt)
+    with pytest.raises(ValueError, match="recurrent"):
+        export(ckpt, tmp_path / "recurrent.onnx")

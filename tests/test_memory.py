@@ -164,3 +164,66 @@ def test_since_buckets_are_log_spaced_and_unknown_has_its_own():
     prev = torch.tensor([0] * 9 + [mem.UNKNOWN])
     assert mem.since_bucket(since, prev).tolist() == [0, 1, 3, 4, 4, 5, 13, 14, 14,
                                                       mem.SINCE_BUCKETS - 1]
+
+
+class _Recorder:
+    """Wraps a stateful policy, keeping what each seat saw and did."""
+
+    stateful = True
+
+    def __init__(self, policy):
+        self.policy, self.seen = policy, {}
+
+    def bind(self, vector):
+        self.policy.bind(vector)
+
+    def reset(self, n):
+        self.policy.reset(n)
+        self.seen = {}
+
+    def act(self, observations, masks, rng, keys):
+        actions = self.policy.act(observations, masks, rng, keys=keys)
+        for i, k in enumerate(keys):
+            self.seen.setdefault(int(k), []).append((np.array(observations[i]), int(actions[i])))
+        return actions
+
+
+@needs_rows
+@pytest.mark.engine
+def test_a_recurrent_policy_in_real_battles_carries_what_teacher_forcing_computes(tmp_path):
+    import json
+
+    from clashai.decks import PIGGIES_EQ, REFERENCE_DECKS
+    from clashai.eval.arena import Side, play_matches
+    from clashai.model.policy import NetPolicy
+
+    metadata = json.loads((ROWS / "metadata.json").read_text())
+    spec = Spec.from_metadata(metadata)
+    net = _net(spec)
+    path = tmp_path / "tiny-recurrent.pt"
+    torch.save({"model": net.state_dict(), "description": net.describe(), "step": 0}, path)
+    policy = NetPolicy(path, device="cpu")  # fp32 throughout, so replays agree closely
+    assert policy.stateful
+    rec = _Recorder(policy)
+    # One object on both seats of the same battles.
+    games = play_matches([(Side(rec, PIGGIES_EQ), Side(rec, REFERENCE_DECKS["hog_26"]))], [3])
+    assert len(games[0]) == 2 and all(g.fault == "none" for g in games[0])
+    assert sorted(rec.seen) == [0, 1, 2, 3]  # two battles, two seats each
+    for k, seen in rec.seen.items():
+        obs = np.stack([o for o, _ in seen])
+        actions = np.array([a for _, a in seen])
+        header, ents, valid = policy.inputs(obs)
+        cards = mem.played_cards(header.numpy(), actions, spec.header["hand_card"],
+                                 spec.first_ability, spec.tiles)
+        prev, prev_card, since = mem.history(actions, cards)
+        memory = {"lanes": 1, "first": torch.zeros(len(obs), dtype=torch.bool), "state": None,
+                  "prev_action": torch.from_numpy(prev), "prev_card": torch.from_numpy(prev_card),
+                  "since": torch.from_numpy(since)}
+        with torch.no_grad():
+            h, c = policy.net(header, ents, valid, memory)["state"]
+        torch.testing.assert_close(policy._state[0][k], h[0, 0], rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(policy._state[1][k], c[0, 0], rtol=1e-4, atol=1e-4)
+        assert policy._hist["prev_action"][k] == actions[-1]
+        assert (actions != 0).sum() > 0, "the seat never played"
+    with pytest.raises(ValueError):
+        policy.act(obs[:1], np.ones((1, spec.actions), bool), np.random.default_rng(0))

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import memory as mem
 from .net import PolicyNet
 
 
@@ -32,8 +33,12 @@ class NetPolicy:
 
     A card or tile temperature of 0 takes the most likely card or tile; whether to play at all is
     still drawn. All at 1 is the network's own distribution. The scores are computed in fp32
-    (``PolicyNet.fp32_heads``), so near-ties are ranked exactly. Random numbers come from the arena's generator,
-    so games are reproducible.
+    (``PolicyNet.fp32_heads``), so near-ties are ranked exactly. Random numbers come from the
+    arena's generator, so games are reproducible.
+
+    A recurrent network (``lstm`` > 0) makes the policy ``stateful``: it keeps the core's state and
+    its own history (:mod:`clashai.model.memory`) per seat, keyed by the arena (``keys``: battle
+    row * 2 + seat), from :meth:`reset` until the next. One object can play both seats.
     """
 
     def __init__(self, checkpoint: str | Path, device: str = "cuda", temperature: float = 1.0,
@@ -46,6 +51,31 @@ class NetPolicy:
         self.tile_top_p = tile_top_p
         self.name = name or Path(checkpoint).parent.name
         self.step = ckpt.get("step")
+        self.stateful = bool(self.net.config.lstm)
+        self._state: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._hist: dict | None = None
+
+    def reset(self, n: int) -> None:
+        """Fresh state for ``n`` battles (keys 0 to 2n - 1), before their first decision."""
+        if self.stateful:
+            h = self.net.config.lstm
+            self._state = (torch.zeros(2 * n, h, device=self.device),
+                           torch.zeros(2 * n, h, device=self.device))
+            self._hist = mem.start(2 * n, self.device)
+
+    def inputs(self, observations) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The network's header, units and valid from flat observations, on the device."""
+        spec = self.net.spec
+        obs = np.asarray(observations)
+        hi, ei = spec.header_ints, spec.entity_ints
+        counts = np.minimum(obs[:, self.count], self.net.config.max_entities)
+        width = max(1, int(counts.max()))
+        ents = obs[:, hi:hi + width * ei].reshape(len(obs), width, ei)
+        valid = np.arange(width)[None, :] < counts[:, None]
+        dev = self.device
+        return (torch.from_numpy(np.ascontiguousarray(obs[:, :hi])).to(dev),
+                torch.from_numpy(np.ascontiguousarray(ents)).to(dev),
+                torch.from_numpy(valid).to(dev))
 
     def bind(self, vector) -> None:
         s, spec = vector.schema, self.net.spec
@@ -57,21 +87,21 @@ class NetPolicy:
         self.count = s.header["entity_count"][0]
 
     @torch.no_grad()
-    def act(self, observations, masks, rng) -> np.ndarray:
-        spec, net = self.net.spec, self.net
-        obs = np.asarray(observations)
-        b = len(obs)
-        hi, ei = spec.header_ints, spec.entity_ints
-        counts = np.minimum(obs[:, self.count], net.config.max_entities)
-        width = max(1, int(counts.max()))
-        ents = obs[:, hi:hi + width * ei].reshape(b, width, ei)
-        valid = np.arange(width)[None, :] < counts[:, None]
-        dev = self.device
-        header = torch.from_numpy(np.ascontiguousarray(obs[:, :hi])).to(dev)
+    def act(self, observations, masks, rng, keys=None) -> np.ndarray:
+        spec, net, dev = self.net.spec, self.net, self.device
+        header, ents, valid = self.inputs(observations)
+        b = len(header)
         mask = torch.from_numpy(np.asarray(masks, dtype=bool)).to(dev)
+        memory = k = None
+        if self.stateful:
+            if keys is None or self._state is None:
+                raise ValueError("a recurrent policy needs reset(n) before play and keys per row")
+            k = torch.as_tensor(np.asarray(keys), dtype=torch.long, device=dev)
+            memory = {"lanes": b, "first": torch.zeros(b, dtype=torch.bool, device=dev),
+                      "state": (self._state[0][k][None], self._state[1][k][None]),
+                      **{name: v[k] for name, v in self._hist.items()}}
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
-            out = net(header, torch.from_numpy(np.ascontiguousarray(ents)).to(dev),
-                      torch.from_numpy(valid).to(dev))
+            out = net(header, ents, valid, memory)
             probs = type_probs(out["type_logits"].float(), spec.type_mask(mask), self.temperature,
                                self.card_temperature)
             kind = _sample(probs.cpu().numpy(), rng)
@@ -84,8 +114,17 @@ class NetPolicy:
                                    spec.tile_mask(mask[rows], slot),
                                    self.temperature * self.tile_temperature, self.tile_top_p)
                 tile[play] = _sample(probs.cpu().numpy(), rng)
-        actions = spec.encode(torch.from_numpy(kind), torch.from_numpy(tile)).numpy()
-        return actions.astype(np.int32)
+        actions = spec.encode(torch.from_numpy(kind), torch.from_numpy(tile))
+        if self.stateful:
+            h, c = out["state"]
+            self._state[0][k], self._state[1][k] = h[0].float(), c[0].float()
+            a = actions.to(dev)
+            cards = mem.played_cards(header, a, spec.header["hand_card"], spec.first_ability,
+                                     spec.tiles)
+            new = mem.advance({name: v[k] for name, v in self._hist.items()}, a, cards)
+            for name, v in new.items():
+                self._hist[name][k] = v
+        return actions.numpy().astype(np.int32)
 
 
 def type_probs(logits: torch.Tensor, mask: torch.Tensor, temperature: float = 1.0,
