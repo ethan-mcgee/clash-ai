@@ -40,6 +40,19 @@ class Summary:
                 f"{self.low:.1%}-{self.high:.1%}")
 
 
+def paired_difference(a: dict, b: dict, z: float = 1.959964) -> tuple[float, float, float, int]:
+    """``a`` minus ``b`` over the games both played with a result: mean and 95% interval of the
+    per-game differences, and the number of pairs. ``a`` and ``b`` map a game's key (such as deck,
+    seed and seat) to its score."""
+    d = [a[k] - b[k] for k in a.keys() & b.keys() if a[k] is not None and b[k] is not None]
+    n = len(d)
+    if n < 2:
+        return float("nan"), float("nan"), float("nan"), n
+    mean = sum(d) / n
+    half = z * math.sqrt(sum((x - mean) ** 2 for x in d) / (n - 1) / n)
+    return mean, mean - half, mean + half, n
+
+
 def summarize(scores: Iterable[float | None]) -> Summary:
     """Summary of per-game scores (1, 0.5, 0, or None for a game with no result)."""
     scores = list(scores)

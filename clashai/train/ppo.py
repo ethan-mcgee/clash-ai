@@ -219,15 +219,16 @@ class Evaluator:
 
     def __call__(self, checkpoint: str) -> dict:
         from ..decks import REFERENCE_DECKS
-        from ..eval.arena import Side, play
+        from ..eval.arena import Side, play_matches
         from ..model.policy import NetPolicy
 
         policy = NetPolicy(checkpoint, name="learner")
-        by_deck = {}
-        for name, d in REFERENCE_DECKS.items():
-            games = play(Side(policy, PIGGIES_EQ), Side(self.opponent, d), self.seeds,
-                         threads=self.threads)
-            by_deck[name] = float(np.mean([g.score for g in games]))
+        # Every deck side by side in one vector, rather than deck by deck.
+        played = play_matches([(Side(policy, PIGGIES_EQ), Side(self.opponent, d))
+                               for d in REFERENCE_DECKS.values()], self.seeds,
+                              threads=self.threads)
+        by_deck = {name: float(np.mean([g.score for g in games]))
+                   for name, games in zip(REFERENCE_DECKS, played, strict=True)}
         del policy
         torch.cuda.empty_cache()
         return {"score": float(np.mean(list(by_deck.values()))), "by_deck": by_deck,
