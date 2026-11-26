@@ -57,3 +57,38 @@ def test_importing_clashai_confines_the_process_to_the_budget():
     process, system = ctypes.c_size_t(), ctypes.c_size_t()
     assert k.GetProcessAffinityMask(k.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(system))
     assert bin(process.value).count("1") == paths.cpu_budget()
+
+
+def _jdk(root, name, version):
+    home = root / name
+    home.mkdir(parents=True)
+    (home / "release").write_text(f'IMPLEMENTOR="x"\nJAVA_VERSION="{version}"\n')
+    return home
+
+
+def test_java_21_is_found_where_the_system_installs_jdks(tmp_path, monkeypatch):
+    """With no JAVA_HOME naming Java 21, the JDK 21 among the installed ones is chosen, on
+    Windows and Linux alike; CLASHAI_JAVA_HOME wins when given."""
+    root = tmp_path / "jvm"
+    _jdk(root, "java-25-openjdk-amd64", "25.0.1")
+    want = _jdk(root, "java-21-openjdk-amd64", "21.0.13.1")
+    _jdk(root, "java-17-openjdk-amd64", "17.0.9")
+    monkeypatch.setattr(paths, "jdk_roots", lambda: [tmp_path / "missing", root])
+    monkeypatch.delenv("CLASHAI_JAVA_HOME", raising=False)
+    monkeypatch.setenv("JAVA_HOME", str(root / "java-25-openjdk-amd64"))
+    assert paths.ensure_java() == want
+    assert os.environ["JAVA_HOME"] == str(want)
+    other = _jdk(tmp_path, "elsewhere", "21.0.2")
+    monkeypatch.setenv("CLASHAI_JAVA_HOME", str(other))
+    assert paths.ensure_java() == other
+
+
+def test_no_java_21_is_an_error_that_says_what_to_install(tmp_path, monkeypatch):
+    import pytest
+
+    _jdk(tmp_path, "java-17", "17.0.9")
+    monkeypatch.setattr(paths, "jdk_roots", lambda: [tmp_path])
+    monkeypatch.delenv("CLASHAI_JAVA_HOME", raising=False)
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    with pytest.raises(RuntimeError, match="no JDK 21"):
+        paths.ensure_java()
