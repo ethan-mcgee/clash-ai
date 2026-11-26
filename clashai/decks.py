@@ -21,12 +21,17 @@ class Deck:
     cards: tuple[str, ...]
     evolutions: tuple[str, ...] = ()
     archetype: str = ""
+    flags: tuple[int, ...] = ()
+    """crforge slot flags as recorded, one per card in deck order (a deck met in the replays,
+    whose slots may also hold a hero); when given, they replace the flags ``evolutions`` makes."""
 
     def __post_init__(self) -> None:
         if len(self.cards) != 8 or len(set(self.cards)) != 8:
             raise ValueError(f"{self.name}: a deck is 8 different cards")
         if not set(self.evolutions) <= set(self.cards) or len(self.evolutions) > 2:
             raise ValueError(f"{self.name}: up to 2 evolutions, each a card of the deck")
+        if self.flags and len(self.flags) != 8:
+            raise ValueError(f"{self.name}: slot flags are one per card")
 
     @property
     def key(self) -> str:
@@ -36,6 +41,8 @@ class Deck:
 
     def slots(self, slot_evolution: int) -> list[int]:
         """crforge's slot flags for ``VectorBattle.reset``, one per card in deck order."""
+        if self.flags:
+            return list(self.flags)
         return [slot_evolution if card in self.evolutions else 0 for card in self.cards]
 
 

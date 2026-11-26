@@ -28,6 +28,8 @@ import numpy as np
 
 from .. import paths
 
+PART = ".part.npz"  # a battle being written
+
 
 @dataclass(frozen=True)
 class Layout:
@@ -52,11 +54,15 @@ def compact(source: Path, target: Path, layout: Layout) -> int:
     counts = header[:, layout.entity_count].astype(np.int64)
     table = obs[:, layout.header_ints:].reshape(rows, layout.max_entities, layout.entity_ints)
     used = np.arange(layout.max_entities)[None, :] < counts[:, None]
+    # Written beside the target and renamed into place, so an interrupted run never leaves a
+    # partial battle under the target's name.
+    part = target.with_name(target.name.removesuffix(".npz") + PART)
     np.savez_compressed(
-        target, header=header, entities=table[used],
+        part, header=header, entities=table[used],
         offsets=np.concatenate([[0], np.cumsum(counts)]),
         masks=np.packbits(z["masks"], axis=1), actions=z["actions"], ticks=z["ticks"],
         seats=z["seats"].astype(np.int8), flags=z["flags"])
+    os.replace(part, target)
     return rows
 
 
@@ -104,7 +110,7 @@ def main(argv: list[str] | None = None) -> None:
     jobs = [(f, target / "battles" / (f.name.split("_docs_")[-1].removesuffix(".json.npz") + ".npz"),
              layout, args.verify < 0 or i < args.verify) for i, f in enumerate(files)]
     rows = bad = 0
-    with ProcessPoolExecutor(max_workers=os.cpu_count() // 2) as pool:
+    with ProcessPoolExecutor(max_workers=max(1, paths.cpu_budget() // 2)) as pool:
         for name, n, ok in pool.map(_job, jobs, chunksize=4):
             rows += n
             bad += not ok

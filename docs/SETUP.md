@@ -5,7 +5,8 @@ How this project's Windows 11 machine runs crforge and trains on it. crforge's o
 ## Hardware
 
 - GPU: RTX 3090 Ti, 24 GB, NVIDIA driver 621.14
-- CPU: Ryzen 9 7900X, 12 cores / 24 threads. **As of 2026-11-24 Windows sees only 6 cores / 12 threads**: one core cluster is disabled in the BIOS. The full 12 / 24 will be re-enabled soon; the throughput below was measured on 6 / 12 and will be re-measured then. Code sizes thread counts from the machine, never a hard-coded 12.
+- CPU: Ryzen 9 7900X, 12 cores / 24 threads, all enabled since 2026-11-24 (BIOS 4005; before that Windows saw 6 / 12). Code sizes thread counts from the machine, never a hard-coded number.
+- CPU cap: importing `clashai` confines the process to **16 logical processors (8 cores)** with a CPU affinity mask, so the rest of the machine stays free (`clashai.paths.apply_cpu_cap`). Everything it starts inherits the cap: crforge's JVM (told the same count with `-XX:ActiveProcessorCount` at its start, through crforge's `jvm_args`), worker processes, Gradle builds, PyTorch and NumPy (8 threads each). Engine-only work (conversion, labelling) uses all 16; the engine beside training uses 8. Set `CLASHAI_MAX_THREADS` to another number, or to `all`, to change it. Replay conversion runs as fast under the cap as on all 24 threads (61 s per 512 replays). crforge's own tools (`crforge-env-bench`, Gradle run directly) are not capped.
 - RAM: 64 GB
 - Disks: C: is nearly full, so everything large goes on **D:**
 
@@ -51,7 +52,7 @@ cd third_party\crforge
 C:\Python312\python.exe -m venv D:\ml-data\clash-ai\venv
 $py = "D:\ml-data\clash-ai\venv\Scripts\python.exe"
 & $py -m pip install "torch==2.5.1" --index-url https://download.pytorch.org/whl/cu124
-& $py -m pip install "third_party\crforge\python[dev]" pyarrow pyyaml
+& $py -m pip install -e "third_party\crforge\python[dev]" pyarrow pyyaml
 ```
 
 ## Running crforge from Python
@@ -73,18 +74,21 @@ cd third_party\crforge\python
 
 - Throughput, `crforge-env-bench --engine ladder --decision-ticks 5` (random play, no neural network; one env step is one decision of one battle):
 
-| threads | 64 battles | 256 battles |
-|---:|---:|---:|
-| 1 | 11,308 steps/s | 12,164 steps/s |
-| 6 | 24,766 | 37,086 |
-| 12 | 25,624 | 40,492 |
+| threads | 64 battles | 256 battles | 512 battles |
+|---:|---:|---:|---:|
+| 1 | 11,308 steps/s | 12,164 steps/s | |
+| 6 | 21,802 | 39,449 | 42,783 |
+| 12 | 28,517 | 57,114 | 64,818 |
+| 24 | 30,458 | 63,217 | 83,169 |
 
-  At about 800 decisions a game, 40k steps/s is about 180,000 games an hour from the engine alone. Gains stop near 6 threads, which matches the 6 cores Windows sees.
+  Measured 2026-11-24 with all 12 cores / 24 threads enabled (the 1-thread row is from the earlier 6-core setup; runs vary by about 20%). At about 800 decisions a game, 83k steps/s is about 370,000 games an hour from the engine alone. Before the BIOS change, Windows saw 6 cores and gains stopped near 6 threads at about 40k steps/s. Hyperthreads now help at large batches (+28% from 12 to 24 threads at 512 battles), while `clashai` defaults to one thread per physical core (12) to leave room for the Python and GPU side.
+
+- GPU (2026-11-24): RTX 3090 Ti on PCIe 4.0 x16. 8192 x 8192 matmul at 76.6 TFLOPs in bf16 and 29.2 in fp32; 26.8 GB/s pinned host to GPU; 806 GB/s device copy; it holds the 450 W limit at about 60 C with clocks near 1.8 GHz.
 
 ## This project's package
 
 ```powershell
-& $py -m pip install -e ".[dev]"
+& $py -m pip install -e ".[dev,export]"
 & $py -m pytest -q --basetemp=D:/ml-data/clash-ai/tmp/pytest
 & $py -m clashai.eval.scorecard --policy scripted --opponent scripted --seeds 50
 ```
@@ -92,3 +96,20 @@ cd third_party\crforge\python
 - `clashai` sets `JAVA_HOME` to JDK 21 itself (`clashai/paths.py`), so no shell setup is needed. Every location can be overridden with `CLASHAI_DATA`, `CLASHAI_CRFORGE_INSTALL`, `CLASHAI_TABLES` and `CLASHAI_JAVA_HOME`.
 - Tests marked `engine` need the built engine and tables; without them they're skipped, not failed.
 - Scorecards are written to `D:\ml-data\clash-ai\runs\scorecards`.
+
+## Exporting a model and playing against it
+
+`python -m clashai.export.onnx --checkpoint <run>\best.pt --verify <rows folder> --bench` writes `D:\ml-data\clash-ai
+uns\onnx\<run>.onnx` in crforge's model format (export format 1; see `clashai/export/onnx.py`): inputs `observations` and `masks` exactly as the environment writes them, outputs `first_logp`, `tile_logp` and `value`, and metadata naming the schema, vocabulary, deck and levels. `--verify` compares ONNX Runtime with PyTorch on real rows; `--bench` times both. Checkpoints from before 2026-11-24 need `--metadata <rows folder>\metadata.json`.
+
+- ONNX Runtime must be `onnxruntime-gpu==1.24.4`. Newer builds are built for CUDA 13; with PyTorch's CUDA 12.4 libraries they fall back to the CPU silently. `clashai.export.onnx.session` refuses that fallback.
+- First export, the 600-step trial (2026-11-24): ONNX Runtime matched PyTorch to 4e-6 on the CPU and 5e-3 on the GPU over 512 real rows, with the same most likely choice on every row. crforge's `ModelOpponentTest` (6 tests) passed, playing a whole battle: 1,200 decisions, 76 plays, 0 refused, 18.6 ms a decision on the CPU with the battle.
+- Inference speed at batch 1,024 is about 4,300 observations a second through ONNX Runtime fp32 and 6,500 through PyTorch bf16. Half of that time is the tile head run for all four hand slots, which this format asks for. Self-play only needs the played slot's tiles (1.7 ms for 64 rows instead of 90 ms) and batches grouped by unit count (46 ms instead of 78), roughly 3 to 4 times faster.
+
+Play against it in crforge's visualizer, from `third_party\crforge` (`JAVA_HOME` set to JDK 21):
+
+```powershell
+.\gradlew.bat --no-daemon :desktop:run "-Pcrforge.dataVersion=16.635.8" "-Pcrforge.assetSource=cdn" "-Pcrforge.cache=D:/ml-data/clash-ai/crforge-cache" "--args=--model D:/ml-data/clash-ai/runs/onnx/<run>.onnx --model-sample"
+```
+
+`--model-sample` draws the model's moves from its probabilities. Without it the model takes its most likely move, which is nearly always a wait. A headless check of a model file: `.\gradlew.bat --no-daemon :desktop:test --tests "*ModelOpponentTest*" "-Pcrforge.modelFile=<file.onnx>"` with the same properties.

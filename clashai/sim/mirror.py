@@ -2,18 +2,18 @@
 
 The arena is symmetric across its long axis: a play on tile column ``c`` mirrors to column
 ``cols - 1 - c``, and an x coordinate in game units to ``width - x``. Rows, ids, cards and hit
-points are unchanged. Values the seat is not shown (``schema.unknown``, -1) stay unknown.
+points are unchanged, except that the header's left and right princess towers (ordered as the seat's
+player sees them) swap. Values the seat is not shown (``schema.unknown``, -1) stay unknown.
+:meth:`clashai.model.spec.Spec.mirror` is the same rule on batches of training rows.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-# Header fields holding x coordinates in the seat's frame, in game units.
-_HEADER_X = ("pending_x", "enemy_play_x")
-# Entity columns holding x coordinates; the x velocity is negated instead.
-_ENTITY_X = ("x", "target_x", "aim_x")
-_ENTITY_DX = ("dx",)
+# Header fields ordered left then right as the seat's player sees them.
+_HEADER_SWAP = (("own_left_hp", "own_right_hp"), ("own_left_max_hp", "own_right_max_hp"),
+                ("enemy_left_hp", "enemy_right_hp"), ("enemy_left_max_hp", "enemy_right_max_hp"))
 
 
 def mirror_actions(schema, actions) -> np.ndarray:
@@ -39,18 +39,28 @@ def mirror_mask(schema, mask: np.ndarray) -> np.ndarray:
 
 
 def mirror_observation(schema, observation: np.ndarray) -> np.ndarray:
-    """One v4 seat observation reflected left to right."""
+    """One v4 seat observation reflected left to right.
+
+    Only real points move: an unused pending row's 0, an enemy play's or a spell's unknown -1, and
+    the 0 of no target or no aim stay as they are.
+    """
     obs = np.array(observation, copy=True)
     width = schema.width_units
-    for name in _HEADER_X:
-        idx = list(schema.header[name])
-        values = obs[idx]
-        obs[idx] = np.where(values == schema.unknown, values, width - values)
-    count = int(obs[schema.header["entity_count"][0]])
-    rows = obs[schema.header_ints:].reshape(schema.max_entities, schema.entity_ints)[:count]
-    for name in _ENTITY_X:
-        col = rows[:, schema.entity[name]]
-        rows[:, schema.entity[name]] = np.where(col == schema.unknown, col, width - col)
-    for name in _ENTITY_DX:
-        rows[:, schema.entity[name]] = -rows[:, schema.entity[name]]
+    h, e = schema.header, schema.entity
+    px, pcard = list(h["pending_x"]), list(h["pending_card"])
+    obs[px] = np.where(obs[pcard] >= 0, width - obs[px], obs[px])
+    ex = list(h["enemy_play_x"])
+    obs[ex] = np.where(obs[ex] == schema.unknown, obs[ex], width - obs[ex])
+    for left, right in _HEADER_SWAP:
+        a, b = h[left][0], h[right][0]
+        obs[a], obs[b] = obs[b], obs[a]
+    count = int(obs[h["entity_count"][0]])
+    rows = obs[schema.header_ints:].reshape(-1, schema.entity_ints)[:count]
+    rows[:, e["x"]] = width - rows[:, e["x"]]
+    target = rows[:, e["target"]] >= 0
+    rows[:, e["target_x"]] = np.where(target, width - rows[:, e["target_x"]], rows[:, e["target_x"]])
+    aim_x, aim_y = rows[:, e["aim_x"]], rows[:, e["aim_y"]]
+    aimed = ((aim_x != 0) | (aim_y != 0)) & (aim_x != schema.unknown)
+    rows[:, e["aim_x"]] = np.where(aimed, width - aim_x, aim_x)
+    rows[:, e["dx"]] = -rows[:, e["dx"]]
     return obs

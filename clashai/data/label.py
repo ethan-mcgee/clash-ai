@@ -1,26 +1,36 @@
-"""Converted battles into training rows, through crforge's replay labeller.
+"""Converted battles into compact training rows, through crforge's replay labeller.
 
     python -m clashai.data.label --run piggies_eq-screen-team0-v0-t0
 
-Reads a conversion run's ``summary.jsonl``, keeps the battles that pass the quality filter, and
+``--resume`` skips the battles already in the dataset folder, so a conversion run that grew since it
+was last labelled costs only its new battles.
+
+Reads a conversion run's summaries (:func:`.convert.summary_files`), keeps the battles that pass the quality filter, and
 labels each: at every decision (5 ticks) of each seat, the observation and mask the environment
 shows that seat and the action that gives the player's command, or the wait. ``--check`` also
 drives each battle back from its labels alone; at 5-tick decisions it stops at the first command
 given between two decisions (driven up to 4 ticks early), so it proves little there.
 
-Writes ``<data>/labelled/<run>/``: one ``.npz`` of rows per battle and crforge's ``metadata.json``
-and ``counts.jsonl``, plus ``index.jsonl`` naming, for each battle, which seat played which deck,
-which seats played Piggies EQ and each seat's result.
+crforge writes about 54 MB of uncompressed rows a battle, so battles are labelled in chunks, each
+compacted (:mod:`.dataset`, by ``--workers`` processes: one core would take as long as the engine's
+labelling) and its raw rows deleted before the next. Writes
+``<data>/dataset/<run>-<filter>/``: ``battles/<tag>.npz``, crforge's ``metadata.json``,
+``counts.jsonl``, and ``index.jsonl`` naming each battle's decks, slot flags, Piggies EQ seats,
+each seat's result and whether any deck is in the held-out split.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 
 from .. import paths
-from ..decks import PIGGIES_EQ
+from ..decks import PIGGIES_EQ, is_held_out
+from .convert import summary_files
+from .dataset import PART, Layout, compact
 
 FILTERS = {
     "strict": lambda r: r["towers_exact"] and r["dropped"] == 0,
@@ -38,46 +48,84 @@ def piggies_seats(row: dict) -> list[int]:
     return out
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Label converted battles for imitation")
-    parser.add_argument("--run", required=True, help="a folder under <data>/converted")
-    parser.add_argument("--filter", choices=FILTERS, default="standard")
-    parser.add_argument("--threads", type=int, default=None)
-    parser.add_argument("--check", action="store_true")
-    args = parser.parse_args(argv)
-
-    source = paths.data_root() / "converted" / args.run
-    rows = [json.loads(line) for line in open(source / "summary.jsonl", encoding="utf-8")]
-    keep = [r for r in rows if not r["problem"] and FILTERS[args.filter](r)]
-    out = paths.data_root() / "labelled" / f"{args.run}-{args.filter}"
-    out.mkdir(parents=True, exist_ok=True)
-    print(f"{len(keep)} of {len(rows)} battles pass the '{args.filter}' filter", flush=True)
-
-    paths.ensure_java()
-    from crforge_env import label_replays
-
-    run = label_replays([source / "docs" / f"{r['tag']}.json" for r in keep], paths.install_dir(),
-                        paths.tables_dir(), decision_ticks=5,
-                        threads=args.threads or paths.default_threads(),
-                        check=args.check, out_dir=out)
-    with open(out / "index.jsonl", "w", encoding="utf-8") as f:
-        for r in keep:
-            results = [_result(r, seat) for seat in (0, 1)]
-            f.write(json.dumps({"tag": r["tag"], "decks": r["decks"], "slots": r["slots"],
-                                "piggies_seats": piggies_seats(r), "results": results,
-                                "towers_exact": r["towers_exact"]}) + "\n")
-    print("unreadable:", run.unreadable or "none")
-    print("totals:", json.dumps(run.totals(), indent=1)[:3000])
-    counts = Counter(len(piggies_seats(r)) for r in keep)
-    print(f"battles by Piggies EQ seats: {dict(counts)}; written to {out}")
-
-
 def _result(row: dict, seat: int) -> str:
     """A seat's result by the converted battle's crowns, which equal the recording's under the
     standard and strict filters."""
     side, other = row["sides"][seat], row["sides"][1 - seat]
     mine, theirs = row["crowns"].get(side, 0), row["crowns"].get(other, 0)
     return "win" if mine > theirs else "loss" if mine < theirs else "draw"
+
+
+def index_row(r: dict) -> dict:
+    return {"tag": r["tag"], "decks": r["decks"], "slots": r["slots"],
+            "piggies_seats": piggies_seats(r), "results": [_result(r, s) for s in (0, 1)],
+            "held_out": [is_held_out(d) for d in r["decks"]], "towers_exact": r["towers_exact"]}
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Label converted battles for imitation")
+    parser.add_argument("--run", required=True, help="a folder under <data>/converted")
+    parser.add_argument("--filter", choices=FILTERS, default="standard")
+    parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument("--chunk", type=int, default=400, help="battles labelled at a time")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="processes compacting labelled battles; half the CPU budget by default")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip battles already labelled into the dataset folder")
+    args = parser.parse_args(argv)
+
+    source = paths.data_root() / "converted" / args.run
+    rows = []
+    for summary in summary_files(source):
+        with open(summary, encoding="utf-8") as f:
+            rows += [json.loads(line) for line in f]
+    keep = [r for r in rows if not r["problem"] and FILTERS[args.filter](r)]
+    out = paths.data_root() / "dataset" / f"{args.run}-{args.filter}"
+    raw = paths.data_root() / "labelled" / f"{args.run}-{args.filter}-chunk"
+    (out / "battles").mkdir(parents=True, exist_ok=True)
+    done = set()
+    if args.resume:
+        done = {f.name.removesuffix(".npz") for f in (out / "battles").glob("*.npz")
+                if not f.name.endswith(PART)}
+    todo = [r for r in keep if r["tag"] not in done]
+    print(f"{len(keep)} of {len(rows)} battles pass the '{args.filter}' filter; "
+          f"{len(keep) - len(todo)} labelled before", flush=True)
+
+    paths.ensure_java()
+    from crforge_env import label_replays
+
+    totals: Counter = Counter()
+    layout = None
+    if args.resume and (out / "metadata.json").exists():
+        layout = Layout.from_metadata(json.loads((out / "metadata.json").read_text()))
+    workers = args.workers or max(1, paths.cpu_budget() // 2)
+    with (open(out / "counts.jsonl", "a" if args.resume else "w", encoding="utf-8") as counts,
+          ProcessPoolExecutor(workers) as pool):
+        for start in range(0, len(todo), args.chunk):
+            chunk = todo[start:start + args.chunk]
+            if raw.exists():
+                shutil.rmtree(raw)
+            run = label_replays([source / "docs" / f"{r['tag']}.json" for r in chunk],
+                                paths.install_dir(), paths.tables_dir(), decision_ticks=5,
+                                threads=args.threads or paths.cpu_budget(),
+                                check=args.check, out_dir=raw, jvm_args=paths.jvm_args())
+            if layout is None:
+                metadata = (raw / "metadata.json").read_text()
+                (out / "metadata.json").write_text(metadata)
+                layout = Layout.from_metadata(json.loads(metadata))
+            totals.update({k: v for k, v in run.totals().items() if isinstance(v, int)})
+            counts.write((raw / "counts.jsonl").read_text())
+            files = sorted(raw.glob("*.npz"))
+            targets = [out / "battles" / (f.name.split("_docs_")[-1].removesuffix(".json.npz") + ".npz")
+                       for f in files]
+            list(pool.map(compact, files, targets, [layout] * len(files)))
+            shutil.rmtree(raw)
+            print(f"{min(start + args.chunk, len(todo))}/{len(todo)} battles labelled", flush=True)
+    with open(out / "index.jsonl", "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(index_row(r)) + "\n" for r in keep)
+    print("totals:", json.dumps(dict(totals)))
+    print(f"written to {out}")
 
 
 if __name__ == "__main__":

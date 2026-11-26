@@ -5,6 +5,10 @@ pair start from the same battle seed, so luck in the battle's random draws (the 
 delays and spreads) is shared between the two sides instead of deciding the result.
 
 Results are reproducible: the same sides, seeds, batch size and ``rng_seed`` give the same games.
+
+:func:`play_matches` plays several matches (a scorecard's decks) side by side in one vector, so
+the engine's threads and the GPU get every battle's work at each decision instead of one deck's.
+A single match plays exactly as :func:`play` always has.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from ..decks import Deck
-from ..sim.env import make_vector
+from ..sim.env import DECISION_TICKS, make_vector
 
 
 @dataclass(frozen=True)
@@ -37,44 +41,87 @@ class Game:
     crowns_b: int
     ticks: int
     fault: str
+    behaviour: dict | None = None
+    """Side A's play in this game (:mod:`clashai.eval.behaviour`), when asked for."""
 
 
 def play(a: Side, b: Side, seeds: Sequence[int], *, batch: int = 256, rng_seed: int = 0,
-         threads: int | None = None, **vector_options) -> list[Game]:
+         threads: int | None = None, behaviour: bool = False, **vector_options) -> list[Game]:
     """Plays side A against side B on every seed from both seats; returns the games in order."""
-    games = [(int(seed), seat) for seed in seeds for seat in (0, 1)]
+    return play_matches([(a, b)], seeds, batch=batch, rng_seed=rng_seed, threads=threads,
+                        behaviour=behaviour, **vector_options)[0]
+
+
+def play_matches(matches: Sequence[tuple[Side, Side]], seeds: Sequence[int], *, batch: int = 1024,
+                 rng_seed: int = 0, threads: int | None = None, behaviour: bool = False,
+                 **vector_options) -> list[list[Game]]:
+    """Plays every match (side A, side B) on every seed from both seats, all in one vector of up
+    to ``batch`` battles; returns each match's games in order of seed, then seat.
+
+    Each policy acts once per decision on all of its rows. Rows are grouped by role (A or B) and
+    policy object, each group drawing from its own generator, so one match reproduces
+    :func:`play`'s games exactly. With ``behaviour`` each game records side A's play.
+    """
+    seeds = [int(seed) for seed in seeds]
+    games = [(m, seed, seat) for m in range(len(matches)) for seed in seeds for seat in (0, 1)]
+    out: list[list[Game]] = [[] for _ in matches]
     if not games:
-        return []
-    n = min(batch, len(games))
-    out: list[Game] = []
+        return out
+    chunks = -(-len(games) // batch)
+    n = -(-len(games) // chunks)  # even chunks: little padding
+    groups: dict[tuple[int, int], int] = {}
+    policies: dict[int, Any] = {}
+    for role in (0, 1):
+        for match in matches:
+            groups.setdefault((role, id(match[role].policy)), len(groups))
+            policies.setdefault(id(match[role].policy), match[role].policy)
     with make_vector(n, threads, **vector_options) as v:
         s = v.schema
         info = s.info
-        a.policy.bind(v)
-        b.policy.bind(v)
+        for policy in policies.values():
+            policy.bind(v)
+        tracker = None
+        if behaviour:
+            from .behaviour import Behaviour
+
+            tracker = Behaviour(s.header, v.vocabulary, s.hand_slots, s.cols * s.rows,
+                                s.first_ability, vector_options.get("decision_ticks", DECISION_TICKS), n)
+        hi = s.header_ints
         for start in range(0, len(games), n):
             chunk = games[start:start + n]
             real = len(chunk)
             chunk = chunk + [chunk[0]] * (n - real)  # padding, played but not counted
-            a_seat = np.array([seat for _, seat in chunk])
-            on = [[a if seat_of_a == seat else b for seat_of_a in a_seat] for seat in (0, 1)]
+            match_of = np.array([m for m, _, _ in chunk])
+            a_seat = np.array([seat for _, _, seat in chunk])
+            role_seat = np.stack([a_seat, 1 - a_seat])  # (2, n): each role's seat
+            role_group = np.array([[groups[(r, id(matches[m][r].policy))] for m in match_of]
+                                   for r in (0, 1)])
+            on = [[matches[m][0] if a_seat[i] == seat else matches[m][1]
+                   for i, m in enumerate(match_of)] for seat in (0, 1)]
             decks = [[list(side.deck.cards) for side in on[seat]] for seat in (0, 1)]
             slots = [[side.deck.slots(s.slot_evolution) for side in on[seat]] for seat in (0, 1)]
-            setups = [None if a.setup is None and b.setup is None
+            setups = [None if all(side.setup is None for side in on[0] + on[1])
                       else [side.setup for side in on[seat]] for seat in (0, 1)]
-            v.reset([seed for seed, _ in chunk], decks[0], decks[1], slots[0], slots[1],
+            v.reset([seed for _, seed, _ in chunk], decks[0], decks[1], slots[0], slots[1],
                     setups[0], setups[1])
             finished = np.arange(n) >= real
-            rng_a = np.random.default_rng([rng_seed, start, 0])
-            rng_b = np.random.default_rng([rng_seed, start, 1])
+            rngs = [np.random.default_rng([rng_seed, start, g]) for g in range(len(groups))]
+            if tracker is not None:
+                tracker.reset(n)
             results: dict[int, Game] = {}
             while not finished.all():
                 live = np.flatnonzero(~finished)
                 actions = np.zeros((n, 2), np.int32)
-                for side, seats, rng in ((a, a_seat, rng_a), (b, 1 - a_seat, rng_b)):
-                    seat = seats[live]
-                    actions[live, seat] = side.policy.act(v.observations[live, seat],
-                                                          v.masks[live, seat], rng)
+                for (role, key), g in groups.items():
+                    rows = live[role_group[role, live] == g]
+                    if not len(rows):
+                        continue
+                    seat = role_seat[role, rows]
+                    actions[rows, seat] = policies[key].act(v.observations[rows, seat],
+                                                            v.masks[rows, seat], rngs[g])
+                if tracker is not None:
+                    seat = role_seat[0, live]
+                    tracker.add(live, v.observations[live, seat, :hi], actions[live, seat])
                 v.actions[:] = actions
                 v.step()
                 for i in np.flatnonzero(v.dones.astype(bool) & ~finished):
@@ -90,7 +137,9 @@ def play(a: Side, b: Side, seeds: Sequence[int], *, batch: int = 256, rng_seed: 
                     else:
                         score = None
                     crowns = (int(row[info["crowns_0"]]), int(row[info["crowns_1"]]))
-                    results[i] = Game(chunk[i][0], seat, score, crowns[seat], crowns[1 - seat],
-                                      int(row[info["tick"]]), s.fault_names[int(row[info["fault"]])])
-            out += [results[i] for i in range(real)]
+                    results[i] = Game(chunk[i][1], seat, score, crowns[seat], crowns[1 - seat],
+                                      int(row[info["tick"]]), s.fault_names[int(row[info["fault"]])],
+                                      tracker.game(i) if tracker is not None else None)
+            for i in range(real):
+                out[match_of[i]].append(results[i])
     return out

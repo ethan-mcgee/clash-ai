@@ -2,6 +2,11 @@
 
     python -m clashai.data.convert --deck piggies_eq --limit 200
 
+A conversion is bound by one core of Python, not by engine threads, so a big one runs faster as
+several processes side by side, each with ``--shard K/N`` (K = 0 .. N-1): each takes the replays
+whose tag hashes to K, and writes its own ``summary-KofN.jsonl``. :func:`summary_files` lists a
+run's summaries, sharded or not.
+
 The dataset records each battle's decks, levels, towers and every play (card, point, 20 Hz tick),
 but not the battle's random seed or either player's deck order. For each replay:
 
@@ -24,6 +29,7 @@ Each battle is written as a crforge replay document, which crforge's replay labe
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import time
@@ -406,6 +412,27 @@ def _finish(p: Plan, out: Outcome, vector, i: int, out_dir: Path | None) -> None
 
 # -- the run -------------------------------------------------------------------------------------
 
+def summary_files(out_dir: Path) -> list[Path]:
+    """A conversion run's summaries: ``summary.jsonl`` first, then each shard's."""
+    return sorted(out_dir.glob("summary*.jsonl"), key=lambda f: (f.name != "summary.jsonl", f.name))
+
+
+def in_shard(tag: str, shard: tuple[int, int] | None) -> bool:
+    if shard is None:
+        return True
+    k, n = shard
+    return int.from_bytes(hashlib.sha256(tag.encode()).digest()[:4], "big") % n == k
+
+
+def parse_shard(text: str | None) -> tuple[int, int] | None:
+    if text is None:
+        return None
+    k, n = (int(x) for x in text.split("/"))
+    if not 0 <= k < n:
+        raise SystemExit(f"--shard {text}: K/N with 0 <= K < N")
+    return k, n
+
+
 def is_deck(r: Replay, side: str, keys: set[str], evolutions: set[str] | None) -> bool:
     deck = r.side(side).deck
     if {split_key(k)[0] for k in deck} != keys:
@@ -422,47 +449,70 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--deck", choices=["piggies_eq", "all"], default="piggies_eq")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--threads", type=int, default=None,
+                        help="engine threads; the whole CPU budget by default (conversion is engine work)")
     parser.add_argument("--mapping", choices=["native", "screen", "rotate"], default="screen")
     parser.add_argument("--sides", choices=["team0", "data_i"], default="team0")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=0, help="picks among fitting deck orders")
     parser.add_argument("--seed-variant", type=int, default=0, help="changes the battle seed")
     parser.add_argument("--tick-offset", type=int, default=0, help="added to every recorded tick")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip replays already in the summary and append to it")
+    parser.add_argument("--max-new", type=int, default=None,
+                        help="convert at most this many replays in this run (with --resume, in chunks)")
+    parser.add_argument("--shard", default=None,
+                        help="K/N: only the replays whose tag hashes to K of N, to run N side by side")
     args = parser.parse_args(argv)
+    shard = parse_shard(args.shard)
 
-    from ..sim.env import make_vector
     from crforge_env import LadderConfig, VectorBattle
 
     out_dir = args.out or paths.data_root() / "converted" / f"{args.deck}-{args.mapping}-{args.sides}-v{args.seed_variant}-t{args.tick_offset}"
     out_dir.mkdir(parents=True, exist_ok=True)
     root = dataset_dir()
+    summary_path = out_dir / ("summary.jsonl" if shard is None else f"summary-{shard[0]}of{shard[1]}.jsonl")
+    done_tags = set()
+    if args.resume:  # every summary of the run, so a sharded run skips what an unsharded one did
+        for f in summary_files(out_dir):
+            with open(f, encoding="utf-8") as lines:
+                done_tags |= {json.loads(line)["tag"] for line in lines}
     replays = []
+    seen = 0
     for r in read_replays(root):
+        if not in_shard(r.tag, shard):
+            continue
         if args.deck == "all" or any(is_deck(r, side, *PIGGIES) for side in ("team", "opponent")):
-            replays.append(r)
-            if args.limit and len(replays) >= args.limit:
+            seen += 1
+            if r.tag not in done_tags:
+                # Keep only the duration from the payload: the events come from the actions table.
+                replays.append(dataclasses.replace(r, payload={"replay": r.payload.get("replay", {})}))
+            if (args.limit and seen >= args.limit) or (args.max_new and len(replays) >= args.max_new):
                 break
-    print(f"{len(replays)} replays selected", flush=True)
+    print(f"{len(replays)} replays selected ({len(done_tags)} done before)", flush=True)
+    if not replays:
+        if summary_path.exists():
+            report(summary_path)
+        return
     events = load_events(root, {r.tag for r in replays})
     paths.ensure_java()
-    vector = VectorBattle(min(args.batch, len(replays)), paths.default_threads(),
+    vector = VectorBattle(min(args.batch, len(replays)), args.threads or paths.cpu_budget(),
                           install=paths.install_dir(), tables=paths.tables_dir(),
                           config=LadderConfig(decision_ticks=1, level=DEFAULT_LEVEL,
-                                              tower_level=DEFAULT_LEVEL, arena=ARENA))
+                                              tower_level=DEFAULT_LEVEL, arena=ARENA),
+                          jvm_args=paths.jvm_args())
     names = CardNames(vector.vocabulary[i] for i in vector.card_types())
     table = SeedTable()
     rng = np.random.default_rng(args.seed)
-    summary_path = out_dir / "summary.jsonl"
     t0 = time.time()
     done = 0
-    with open(summary_path, "w", encoding="utf-8") as summary:
+    with open(summary_path, "a" if args.resume else "w", encoding="utf-8") as summary:
         pending: list[Plan] = []
 
         def flush():
             nonlocal done
             if pending:
-                for o in drive(pending, vector, out_dir):
-                    summary.write(json.dumps(asdict(o)) + "\n")
+                summary.writelines(json.dumps(asdict(o)) + "\n" for o in drive(pending, vector, out_dir))
                 done += len(pending)
                 pending.clear()
                 print(f"{done}/{len(replays)} replays, {time.time() - t0:.0f} s", flush=True)
@@ -483,8 +533,9 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def report(summary_path: Path) -> None:
-    rows = [json.loads(line) for line in open(summary_path, encoding="utf-8")]
-    ok = [r for r in rows if not r["problem"]]
+    with open(summary_path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f]
+    ok =[r for r in rows if not r["problem"]]
     plays = sum(r["plays"] + r["abilities"] for r in ok)
     print(f"\n{len(rows)} replays: {len(rows) - len(ok)} not convertible "
           f"({dict(_count(r['problem'].split(':')[0] for r in rows if r['problem']))})")

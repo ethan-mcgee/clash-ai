@@ -74,3 +74,31 @@ def test_the_mask_of_an_empty_arena_is_symmetric():
         for seat in (0, 1):
             mask = v.masks[0, seat]
             np.testing.assert_array_equal(mirror_mask(s, mask), mask)
+
+
+@pytest.mark.engine
+def test_the_header_towers_follow_their_mirrored_entities():
+    """The header's left princess tower is the one on the seat's left, before and after a mirror."""
+    with make_vector(8) as v:
+        s = v.schema
+        slots = PIGGIES_EQ.slots(s.slot_evolution)
+        v.reset(list(range(8)), list(PIGGIES_EQ.cards), list(PIGGIES_EQ.cards), slots, slots)
+        policy = RandomLegal(0.3)
+        policy.bind(v)
+        rng = np.random.default_rng(1)
+        for _ in range(1500):
+            v.actions[:] = policy.act(v.observations.reshape(16, -1), v.masks.reshape(16, -1),
+                                      rng).reshape(8, 2)
+            v.step()
+        e, h = s.entity, s.header
+        uneven = 0
+        for o in v.observations.reshape(16, -1):
+            for obs in (o, mirror_observation(s, o)):
+                rows = s.entities(obs)
+                towers = rows[(rows[:, e["kind"]] == 2) & ~((rows[:, e["flags"]] >> 6) & 1).astype(bool)]
+                for side, who in ((0, "own"), (1, "enemy")):
+                    for t in towers[towers[:, e["side"]] == side]:
+                        lane = "left" if t[e["x"]] < s.width_units // 2 else "right"
+                        assert obs[h[f"{who}_{lane}_hp"][0]] == max(t[e["hp"]], 0)
+            uneven += o[h["own_left_hp"][0]] != o[h["own_right_hp"][0]]
+        assert uneven > 0, "no battle damaged one princess tower more than the other"

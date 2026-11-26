@@ -26,10 +26,10 @@ Full plan and milestones: [docs/PLAN.md](docs/PLAN.md). Machine setup: [docs/SET
 |---|---|
 | M0. Foundations: environment, tests, evaluation harness, throughput | done |
 | M1. Data: audit, replay conversion, consistency filter | done: 2,379 Piggies EQ battles, 4.5M rows ([docs/DATA.md](docs/DATA.md)) |
-| M2. Imitation: generalist, then specialist | not started |
-| M3. PPO league | not started |
+| M2. Imitation: generalist, then specialist | done: card 70.1%, tile 34.7%; the generalist is the stronger player, the specialist adds nothing ([docs/IMITATION.md](docs/IMITATION.md)) |
+| M3. PPO league | in progress |
 | M4. Search | not started |
-| M5. Ablations, demo and write-up | not started |
+| M5. Ablations, demo and write-up | ONNX export done early (plays in crforge's visualizer; see [docs/SETUP.md](docs/SETUP.md)) |
 
 ## Scope and ground rules
 
