@@ -46,6 +46,7 @@ import math
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +64,7 @@ from .rows import MAX_ENTITIES, battle_rows, is_val
 
 DATASET = "dataset/all-screen-team0-v0-t0-prefix"
 MAX_SKIPS_PER_HOUR = 20
-PASSTHROUGH = ("snapshot", "group_grad", "wait_grad")  # kept as they are by pin and to
+PASSTHROUGH = ("snapshot", "group_grad", "wait_grad", "packed")  # kept as they are by pin and to
 WIDTHS = (16, 32)  # rows with at most this many units run the trunk together; the rest in one
 
 
@@ -139,9 +140,10 @@ class Stream:
 
     def __init__(self, battles: Battles, items: list, lanes: int, chunk: int, seed: int, *,
                  mirror: float, drop_prev: float, wait_grad: float = 1.0,
-                 snapshot: dict | None = None):
+                 snapshot: dict | None = None, profiles: tuple[Profile, ...] = ()):
         self.battles, self.items, self.lanes, self.chunk, self.seed = battles, items, lanes, chunk, seed
         self.mirror, self.drop_prev, self.wait_grad = mirror, drop_prev, wait_grad
+        self.profiles = tuple(profiles)
         self._cache: dict[int, dict] = {}
         self._order_cache: tuple[int, np.ndarray | None] = (-1, None)
         if snapshot is None:
@@ -200,17 +202,84 @@ class Stream:
                 ln["offset"] += take
                 ln["fresh"] = False
                 need -= take
-        b = assemble(parts)
+        b = assemble(parts, self.profiles, self.battles.spec.first_ability)
         if self.wait_grad < 1.0:
             b["wait_grad"] = self.wait_grad
         return {**b, "snapshot": self.snapshot()}
 
 
-def assemble(parts: list) -> dict:
+@dataclass(frozen=True)
+class Profile:
+    """The fixed sizes of a packed chunk: for each trunk width, how many rows train the trunk
+    (``grad``) and how many only pass through it (``plain``); and how many play rows the tile
+    head takes (``plays``)."""
+
+    grad: tuple[int, ...]
+    plain: tuple[int, ...]
+    plays: int
+    widths: tuple[int, ...] = (*WIDTHS, MAX_ENTITIES)
+
+
+def default_profiles(rows: int) -> tuple[Profile, ...]:
+    """Profiles for chunks of ``rows`` decisions with a tenth of the waits training the trunk,
+    scaled from what 400 chunks of 4,096 rows of the all-decks dataset held (rows of at most 16
+    units: 3,040 +- 70 plain, 463 +- 20 with gradient; 17 to 32: 480 +- 75 and 82 +- 15; more:
+    27 and 5; 156 +- 12 plays). Narrow first: a chunk takes the first profile it fits."""
+    def scaled(*sizes):
+        return tuple(max(16, -(-s * rows // 4096 // 16) * 16) for s in sizes)
+
+    plays = scaled(208)[0]
+    return (Profile(scaled(496, 96, 16), scaled(3104, 512, 48), plays),
+            Profile(scaled(496, 128, 16), scaled(3008, 640, 64), plays),
+            Profile(scaled(544, 160, 32), scaled(3296, 768, 96), plays))
+
+
+def fixed_groups(counts: np.ndarray, ents: list, grad: np.ndarray, profile: Profile):
+    """The rows in ``profile``'s groups, each of its fixed size: (groups, whether each trains the
+    trunk, each row's place in the groups laid end to end); None when the rows do not fit.
+
+    Rows go by unit count into the narrowest group with room, those with a trunk gradient apart
+    from the rest. A group's spare places repeat row 0 with no units; nothing reads them."""
+    ints = ents[0].shape[1]
+    out, flags = [], []
+    place = np.zeros(len(counts), np.int64)
+    at = 0
+    for flag, caps in ((True, profile.grad), (False, profile.plain)):
+        subset = np.flatnonzero(grad == flag)
+        order = subset[np.argsort(counts[subset], kind="stable")]
+        sorted_counts = counts[order]
+        pos = 0
+        for w, cap in zip(profile.widths, caps, strict=True):
+            take = max(0, min(cap, int(np.searchsorted(sorted_counts, w, "right")) - pos))
+            mine = order[pos:pos + take]
+            rows = np.zeros(cap, np.int64)
+            units = np.zeros((cap, w, ints), np.int32)
+            valid = np.zeros((cap, w), bool)
+            rows[:take] = mine
+            for i, r in enumerate(mine):
+                k = counts[r]
+                units[i, :k] = ents[r][:k]
+                valid[i, :k] = True
+            place[mine] = at + np.arange(take)
+            out.append((rows, units, valid))
+            flags.append(flag)
+            pos += take
+            at += cap
+        if pos < len(order):
+            return None
+    return out, flags, place
+
+
+def assemble(parts: list, profiles: tuple[Profile, ...] = (), first_ability: int = 0) -> dict:
     """Rows from (data, start, count, first, flip, drop[, grad]) parts, in order, with the units
     grouped for the trunk (``groups``: row indices, padded units, valid). With ``grad`` (each
     row's trunk gradient: the sampled waits and every play), ``grad`` and ``group_grad`` (per
-    group: whether its rows train the trunk)."""
+    group: whether its rows train the trunk).
+
+    With ``profiles``, the chunk is packed into the first one it fits (``packed``: which; -1 for
+    none, and the groups are then sized by the rows as usual). A packed chunk has the same
+    shapes as every other of its profile: its groups, ``inverse`` (each row's place in them) and
+    ``play_rows`` with ``play_on`` (the rows that play a card, padded)."""
     def cat(key):
         return np.concatenate([d[key][s:s + c] for d, s, c, *_ in parts])
 
@@ -245,6 +314,21 @@ def assemble(parts: list) -> dict:
                 b["group_grad"].append(flag)
     else:
         b["groups"] = groups(counts, ents)
+    if profiles:
+        b["packed"] = -1
+        plays = np.flatnonzero((b["actions"] > 0) & (b["actions"] < first_ability))
+        grad = b.get("grad", np.ones(n, bool))
+        for i, profile in enumerate(profiles):
+            got = None if len(plays) > profile.plays else fixed_groups(counts, ents, grad, profile)
+            if got is None:
+                continue
+            b["groups"], b["group_grad"], b["inverse"] = got
+            b["grad"] = grad
+            b["play_rows"] = np.zeros(profile.plays, np.int64)
+            b["play_rows"][:len(plays)] = plays
+            b["play_on"] = np.arange(profile.plays) < len(plays)
+            b["packed"] = i
+            break
     return b
 
 
@@ -336,24 +420,20 @@ def run(net: PolicyNet, b: dict, lanes: int, state=None, *, zero_state: bool = F
     action everywhere."""
     spec = net.spec
     n = len(b["actions"])
-    mask_all = unpack_masks(b["masks"], spec.actions)
-    actions_all = b["actions"].long()
+    mask = unpack_masks(b["masks"], spec.actions)
+    actions = b["actions"].long()
     flip = b["flip"]
     parts, rows_all = [], []
-    header = torch.empty_like(b["header"])
-    mask = torch.empty_like(mask_all)
-    actions = torch.empty_like(actions_all)
+    header = torch.where(flip[:, None], spec.mirror_header(b["header"]), b["header"])
+    mask = torch.where(flip[:, None], spec.mirror_mask(mask), mask)
+    actions = torch.where(flip, spec.mirror_actions(actions), actions)
     group_grad = b.get("group_grad")
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=b["header"].is_cuda):
         for i, (rows, units, valid) in enumerate(b["groups"]):
             rows = rows.long()
-            h, m, a = b["header"][rows], mask_all[rows], actions_all[rows]
-            mh, mu, mm, ma = spec.mirror(h, units, valid, m, a)
-            f = flip[rows]
-            h = torch.where(f[:, None], mh, h)
-            units = torch.where(f[:, None, None], mu, units)
-            header[rows], mask[rows] = h, torch.where(f[:, None], mm, m)
-            actions[rows] = torch.where(f, ma, a)
+            h, a = header[rows], actions[rows]
+            units = torch.where(flip[rows][:, None, None], spec.mirror_entities(units, valid),
+                                units)
             if group_grad is not None and not group_grad[i]:
                 with torch.no_grad():  # unsampled waits: forward only
                     enc = net.encode(h, units, valid)
@@ -369,8 +449,10 @@ def run(net: PolicyNet, b: dict, lanes: int, state=None, *, zero_state: bool = F
             rows_all.append(rows)
         fixed = parts[0][1]["fixed"]
         width = max(p["trunk"].shape[1] for _, p in parts)
-        inverse = torch.empty(n, dtype=torch.long, device=actions.device)
-        inverse[torch.cat(rows_all)] = torch.arange(n, device=actions.device)
+        inverse = b.get("inverse")  # given for a packed chunk, whose groups have spare places
+        if inverse is None:
+            inverse = torch.empty(n, dtype=torch.long, device=actions.device)
+            inverse[torch.cat(rows_all)] = torch.arange(n, device=actions.device)
 
         def gather(key, value=0):
             xs = []
@@ -395,13 +477,17 @@ def run(net: PolicyNet, b: dict, lanes: int, state=None, *, zero_state: bool = F
     return out, mask, actions, header
 
 
-def chunk_losses(net, b, lanes, state, *, loss_weight, value_weight, metrics=False, **variant):
+def chunk_losses(net, b, lanes, state, *, loss_weight, value_weight, metrics=False, sync=True,
+                 **variant):
+    """The loss of a chunk, its statistics and the state after it. A packed chunk's play rows
+    are taken as given, so every shape in the step is the profile's."""
     out, mask, actions, header = run(net, b, lanes, state, **variant)
     targets = {"weight": b["weight"], "result": b["result"], "opp_hand": b["opp_hand"],
                "opp_next": b["opp_next"], "piggies": torch.zeros_like(b["first"])}
     loss, stats = losses(net, out, targets, mask, actions, header[:, net.spec.header["tick"][0]],
                          policy_rows="all", loss_weight=loss_weight, value_weight=value_weight,
-                         metrics=metrics)
+                         metrics=metrics, play_rows=b.get("play_rows"), play_on=b.get("play_on"),
+                         sync=sync)
     return loss, stats, out["state"]
 
 

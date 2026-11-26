@@ -159,9 +159,15 @@ def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: fl
 
 def losses(net: PolicyNet, out: dict, b: dict, mask: torch.Tensor, actions: torch.Tensor,
            ticks: torch.Tensor, *, policy_rows: str, loss_weight: float, value_weight: float = 0.1,
-           metrics: bool = False) -> tuple[torch.Tensor, dict]:
+           metrics: bool = False, play_rows: torch.Tensor | None = None,
+           play_on: torch.Tensor | None = None, sync: bool = True) -> tuple[torch.Tensor, dict]:
     """The losses of a batch from the network's output on it (see the module notes). ``b`` holds
-    the rows' targets and weights; ``mask`` and ``actions`` are as the network saw them."""
+    the rows' targets and weights; ``mask`` and ``actions`` are as the network saw them.
+
+    For a step of fixed shapes: ``play_rows`` (K,) names the rows that play a card, padded to a
+    fixed K with any row, and ``play_on`` (K,) is False on the padding; the default finds the
+    rows, whose number varies. ``sync=False`` leaves the statistics as tensors, so the step
+    does not wait for the GPU to read them."""
     spec = net.spec
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=mask.is_cuda):
         kind, tile = spec.decode(actions)
@@ -171,8 +177,11 @@ def losses(net: PolicyNet, out: dict, b: dict, mask: torch.Tensor, actions: torc
         type_mask[ar, kind] = True
         type_logits = out["type_logits"].float().masked_fill(~type_mask, NEG)
         nll_type = F.cross_entropy(type_logits, kind, reduction="none")
-        play_rows = torch.nonzero((kind >= 1) & (kind <= spec.hand_slots)).squeeze(1)
-        slot = kind[play_rows] - 1
+        if play_rows is None:
+            play_rows = torch.nonzero((kind >= 1) & (kind <= spec.hand_slots)).squeeze(1)
+        elif metrics:
+            raise ValueError("metrics need the play rows found, not given")
+        slot = (kind[play_rows] - 1).clamp(0, spec.hand_slots - 1)  # in range on padding too
         tile_mask = spec.tile_mask(mask[play_rows], slot)
         tile_mask[torch.arange(len(play_rows), device=kind.device), tile[play_rows]] = True
         tile_logits = net.tile_logits(out, play_rows, slot).float().masked_fill(~tile_mask, NEG)
@@ -186,8 +195,7 @@ def losses(net: PolicyNet, out: dict, b: dict, mask: torch.Tensor, actions: torc
     outcome = torch.where(result < 0, loss_weight, 1.0)
     on = b["piggies"].float() if policy_rows == "piggies" else torch.ones_like(weight)
     w = weight * outcome * on
-    nll = nll_type.clone()
-    nll[play_rows] += nll_tile
+    nll = nll_type.index_add(0, play_rows, nll_tile if play_on is None else nll_tile * play_on)
     policy = (w * nll).sum() / w.sum().clamp(min=1e-6)
 
     value = (weight * (value_pred.float() - result) ** 2).sum() / weight.sum()
@@ -202,8 +210,9 @@ def losses(net: PolicyNet, out: dict, b: dict, mask: torch.Tensor, actions: torc
     belief_next = (weight * next_nll * (nxt >= 0)).sum() / (weight * (nxt >= 0)).sum().clamp(min=1)
 
     loss = policy + value_weight * value + 0.1 * belief_hand + 0.1 * belief_next
-    stats = {"loss": loss.item(), "policy": policy.item(), "value": value.item(),
-             "belief_hand": belief_hand.item(), "belief_next": belief_next.item()}
+    stats = {"loss": loss, "policy": policy, "value": value, "belief_hand": belief_hand,
+             "belief_next": belief_next}
+    stats = {k: v.item() if sync else v.detach() for k, v in stats.items()}
     if metrics:
         stats["sums"] = (_metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w,
                               hand, known, nxt, logp, result, weight, ticks, nll_tile))
