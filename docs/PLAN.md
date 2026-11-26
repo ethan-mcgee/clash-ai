@@ -146,6 +146,26 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
   - D (required): behaviour (`clashai/eval/behaviour.py`). The candidate's median game is inside the 10th–90th percentile of 2,405 human Piggies EQ games for plays per minute, abilities per minute, share of decisions at full elixir and time of the first play. Each card is played at between half and twice its human share.
   - Report and numbers under `<data>/runs/exit`.
 
+**M3b. generalist-v3: a recurrent model** (the choices and why: `docs/MODEL-IDEAS.md`)
+- Built in five stacked PRs:
+  1. the trunk and heads split, fp32 scores and argmax card and tile;
+  2. distance and relation attention bias;
+  3. an LSTM core with the previous own action;
+  4. the whole-battle trainer `clashai/train/seq.py`;
+  5. stateful play in the arena.
+- The run trains from scratch on every decision of the 107k labelled battles, 64 battle-seats × 32 decisions a step.
+  - Model: 17.5M parameters, d 384, 6 layers, LSTM 512, about 5,800 rows/s.
+  - 3 passes is about 264k steps, **about 30 hours** with validations.
+  - Started hidden, it checkpoints every 15 minutes, and the same command resumes it after a stop or a reboot.
+- Baseline on the same whole-battle validator: generalist-v2 scores 0.2354 (gate 0.1190, card 0.0270, tile 0.0894, calibration 1.076).
+- Go/no-go at the validation nearest 4 hours (about step 40,000, about 80M decisions). Continue only if all hold:
+  - policy loss ≤ 0.250;
+  - play-rate calibration within 0.97–1.03;
+  - zeroing the memory costs at least 0.002;
+  - a 10-seed scorecard's median plays per minute within 20% of generalist-v2's at the same sampling.
+- Otherwise stop, and diagnose from the gate, card and tile split and the previous-action-hidden cost.
+- v3 counts as better only if a paired scorecard against generalist-v2 has its 95% interval above 0. Then recurrent PPO is written and run from it.
+
 **M4. Search**
 - Exit: measured win-rate gain and decision latency.
 
