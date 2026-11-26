@@ -33,6 +33,7 @@ Every amount is scaled here from crforge's integers, so the model takes the raw 
 
 from __future__ import annotations
 
+import itertools
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 
@@ -382,7 +383,7 @@ class PolicyNet(nn.Module):
         # first step and nn.LSTM runs each segment whole.
         cuts = [0, *(torch.nonzero(first[:, 1:].any(0)).squeeze(1) + 1).tolist(), steps]
         ys = []
-        for a, b in zip(cuts[:-1], cuts[1:], strict=True):
+        for a, b in itertools.pairwise(cuts):
             keep = (~first[:, a]).to(x.dtype)[None, :, None]
             y, (h, c) = self.core(x[:, a:b], (h * keep, c * keep))
             ys.append(y)
