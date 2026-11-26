@@ -89,3 +89,17 @@ Kept: crowns and winner reproduced and no command dropped, **2,379 battles** (70
 - crforge's labeller turned them into **4,476,350 rows** (2,238,175 decisions per seat): 99.75% of the 206,334 human commands labelled; 275 two-commands-in-one-window collisions and 240 cards that only came into hand within the window are not.
 - **5,205 commands (2.5%) are labelled with an action their row's mask closes**: given a tick or two after the decision, when elixir or the hand had changed. Training must allow these labels (or drop those rows) rather than let a masked softmax assign them zero probability.
 - Compacted losslessly from 127 GB to 0.77 GB (`clashai/data/dataset.py`; every battle checked to rebuild exactly), in `D:\ml-data\clash-ai\dataset\piggies_eq-screen-team0-v0-t0-standard`.
+
+### All decks, and the prefix filter (2026-11-26)
+
+All 156,160 replays converted. Why battles fail the `standard` filter:
+
+| Outcome | Replays | Share |
+|---|---:|---:|
+| Pass: winner and crowns reproduced, no play dropped | 107,289 | 68.7% |
+| Winner and crowns reproduced, but at least one play dropped | 18,323 | 11.7% |
+| Winner or crowns not reproduced | about 30,500 | 19.6% |
+
+In the dropped-play battles, the first drop comes late: at a median of 98% of the battle (quartiles 91% and 99%). The `prefix` filter (`clashai/data/label.py`) keeps them up to it: rows from one decision before the first dropped play on are cut, for both seats, since from there the player reacts to a battle the simulation no longer shows (and the refused play's own decision would read as a wait). The recorded result still holds, because winner and crowns matched. This keeps about 90% of those battles' decisions.
+
+`dataset/all-screen-team0-v0-t0-prefix`: 125,612 battles, the 107,289 standard ones hard-linked from the standard folder (`--reuse`) and 18,323 cut ones labelled. A cut battle's `counts.jsonl` line gives the decisions it kept and `cut_at`. Battles whose result didn't reproduce stay out: the recording gives no point where the simulation left it.

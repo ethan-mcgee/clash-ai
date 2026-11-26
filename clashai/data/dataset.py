@@ -46,8 +46,12 @@ class Layout:
                    int(s["actions"]), list(s["header_fields"]).index("entity_count"))
 
 
-def compact(source: Path, target: Path, layout: Layout) -> int:
+def compact(source: Path, target: Path, layout: Layout, stop_tick: int | None = None) -> int:
+    """Writes ``source``'s rows compacted to ``target``; with ``stop_tick``, only the rows of
+    decisions before that tick. Returns the rows written."""
     z = np.load(source, allow_pickle=False)
+    keep = slice(None) if stop_tick is None else z["ticks"] < stop_tick
+    z = {k: z[k][keep] for k in ("observations", "masks", "actions", "ticks", "seats", "flags")}
     obs = z["observations"]
     rows = len(obs)
     header = obs[:, :layout.header_ints]
