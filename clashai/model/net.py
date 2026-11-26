@@ -19,6 +19,7 @@ Every amount is scaled here from crforge's integers, so the model takes the raw 
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 
 import torch
@@ -234,43 +235,69 @@ class PolicyNet(nn.Module):
 
     # -- forward -------------------------------------------------------------------------------
 
+    fp32_heads: bool = False
+    """Run everything after the trunk in fp32 even under bf16 autocast: the type and tile scores
+    are then exact enough to rank, which matters when sampling sharpened or taking the most likely
+    card and tile. Not part of the configuration: a play-time choice (NetPolicy sets it)."""
+
     def forward(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor) -> dict:
         """header (B, header_ints) int, entities (B, N, entity_ints) int, valid (B, N) bool."""
+        return self.heads(self.encode(header, entities, valid))
+
+    def encode(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor) -> dict:
+        """The tokens through the trunk: the trunk's normalised output with what the heads need."""
         tokens, pad, fixed = self._tokens(header, entities, valid)
         if torch.onnx.is_in_onnx_export():
             trunk = self.trunk_explicit(tokens, pad)
         else:
             trunk = self.trunk(tokens, src_key_padding_mask=pad)
-        out = self.norm_out(trunk)
-        match, hand, ability = out[:, 0], out[:, 1:5], out[:, fixed - 2:fixed]
-        type_logits = torch.cat([self.wait_head(match), self.slot_head(hand).squeeze(-1),
-                                 self.ability_head(ability).squeeze(-1)], 1)
         ex = entities[..., self.spec.entity["x"]].long()
         ey = entities[..., self.spec.entity["y"]].long()
         tile = ((ey // 1000).clamp(0, self.spec.rows - 1) * self.spec.cols
                 + (ex // 1000).clamp(0, self.spec.cols - 1))
-        return {"type_logits": type_logits, "value": torch.tanh(self.value_head(match).squeeze(-1)),
-                "hand_belief": self.hand_belief(match), "next_belief": self.next_belief(match),
-                "match": match, "hand": hand, "entities": out[:, fixed:], "valid": valid,
+        return {"trunk": self.norm_out(trunk), "fixed": fixed, "valid": valid,
                 "entity_tile": tile}
+
+    def heads(self, enc: dict) -> dict:
+        """Every head's output from :meth:`encode`'s."""
+        out, fixed = enc["trunk"], enc["fixed"]
+        with self._head_precision(out) as out:
+            match, hand, ability = out[:, 0], out[:, 1:5], out[:, fixed - 2:fixed]
+            type_logits = torch.cat([self.wait_head(match), self.slot_head(hand).squeeze(-1),
+                                     self.ability_head(ability).squeeze(-1)], 1)
+            return {"type_logits": type_logits,
+                    "value": torch.tanh(self.value_head(match).squeeze(-1)),
+                    "hand_belief": self.hand_belief(match), "next_belief": self.next_belief(match),
+                    "match": match, "hand": hand, "entities": out[:, fixed:],
+                    "valid": enc["valid"], "entity_tile": enc["entity_tile"]}
+
+    @contextmanager
+    def _head_precision(self, x: torch.Tensor):
+        """Yields ``x`` as is, or in fp32 with autocast off (:attr:`fp32_heads`)."""
+        if not self.fp32_heads:
+            yield x
+            return
+        with torch.autocast(x.device.type, enabled=False):
+            yield x.float()
 
     def trunk_explicit(self, x: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
         """The trunk's pre-norm layers written out with the same weights, for ONNX export.
 
         PyTorch's attention layer records the sequence length as a constant when traced; this
         reshapes with -1 so the exported graph takes any number of units. Equal to ``self.trunk``
-        (tests/test_model.py).
+        (tests/test_model.py), in training too: each layer's dropouts apply while training.
         """
-        b, heads = x.shape[0], self.config.heads
+        b, heads, d = x.shape[0], self.config.heads, self.config.d
         keep = (~pad)[:, None, None, :]  # True where a key may be attended to
         for layer in self.trunk.layers:
             attn = layer.self_attn
             q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
-            q, k, v = (t.reshape(b, -1, heads, self.config.d // heads).transpose(1, 2)
-                       for t in (q, k, v))
-            a = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
-            x = x + attn.out_proj(a.transpose(1, 2).reshape(b, -1, self.config.d))
-            x = x + layer.linear2(F.gelu(layer.linear1(layer.norm2(x))))
+            q, k, v = (t.reshape(b, -1, heads, d // heads).transpose(1, 2) for t in (q, k, v))
+            p = attn.dropout if self.training else 0.0
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=keep, dropout_p=p)
+            x = x + layer.dropout1(attn.out_proj(a.transpose(1, 2).reshape(b, -1, d)))
+            x = x + layer.dropout2(layer.linear2(layer.dropout(F.gelu(
+                layer.linear1(layer.norm2(x))))))
         return x
 
     def _grid(self, out: dict, rows: torch.Tensor) -> torch.Tensor:
@@ -289,12 +316,17 @@ class PolicyNet(nn.Module):
 
     def tile_logits(self, out: dict, rows: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
         """(len(rows), tiles) logits for a play of hand slot `slot` (0-based) in each given row."""
-        cond = torch.cat([out["hand"][rows, slot], out["match"][rows]], -1)
-        return self._tile_head(self._grid(out, rows), cond)
+        with self._head_precision(out["match"]):
+            cond = torch.cat([out["hand"][rows, slot], out["match"][rows]], -1)
+            return self._tile_head(self._grid(out, rows), cond)
 
     def tile_logits_all(self, out: dict) -> torch.Tensor:
         """(B, hand slots, tiles) logits for a play of each hand slot in every row."""
         b, slots = out["hand"].shape[0], self.spec.hand_slots
+        with self._head_precision(out["match"]):
+            return self._tile_logits_all(out, b, slots)
+
+    def _tile_logits_all(self, out: dict, b: int, slots: int) -> torch.Tensor:
         grid = self._grid(out, torch.arange(b, device=out["hand"].device))
         grid = grid.unsqueeze(1).expand(-1, slots, -1, -1, -1).flatten(0, 1)
         cond = torch.cat([out["hand"], out["match"].unsqueeze(1).expand(-1, slots, -1)], -1)

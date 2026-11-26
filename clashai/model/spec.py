@@ -121,10 +121,15 @@ class Spec:
         plays = mask[:, 1:self.first_ability].view(-1, self.hand_slots, self.rows, self.cols)
         mask = torch.cat([mask[:, :1], plays.flip(-1).reshape(len(mask), -1),
                           mask[:, self.first_ability:]], 1)
-        kind, tile = self.decode(actions)
+        return header, entities, mask, self.mirror_actions(actions)
+
+    def mirror_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Each action reflected left to right: a play's tile column flips; others are kept.
+        Values below 0 (no action) are kept too."""
+        kind, tile = self.decode(actions.clamp(min=0))
         row, col = torch.div(tile, self.cols, rounding_mode="floor"), tile % self.cols
-        actions = self.encode(kind, row * self.cols + (self.cols - 1 - col))
-        return header, entities, mask, actions
+        mirrored = self.encode(kind, row * self.cols + (self.cols - 1 - col))
+        return torch.where(actions < 0, actions, mirrored)
 
 
 def unpack_masks(packed: torch.Tensor, actions: int) -> torch.Tensor:

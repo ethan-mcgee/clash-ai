@@ -177,6 +177,46 @@ def test_the_explicit_trunk_for_export_equals_the_trunk(data):
         got = net.trunk_explicit(tokens, pad)
     live = ~pad  # padded tokens' outputs are never read
     torch.testing.assert_close(got[live], want[live], rtol=1e-4, atol=1e-4)
+    net.train()  # training mode, dropout 0: still the same
+    with torch.no_grad():
+        want = net.trunk(tokens, src_key_padding_mask=pad)
+        got = net.trunk_explicit(tokens, pad)
+    torch.testing.assert_close(got[live], want[live], rtol=1e-4, atol=1e-4)
+
+
+def test_fp32_heads_give_fp32_scores_close_to_the_mixed_precision_ones(data):
+    from clashai.train.bc import to_device
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA for bf16 autocast")
+    _, spec, b = data
+    torch.manual_seed(0)
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16)).cuda().eval()
+    batch = to_device(b, "cuda")
+    rows = torch.arange(len(b["actions"]), device="cuda")
+    slot = torch.zeros_like(rows)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        mixed = net(batch["header"], batch["entities"], batch["valid"])
+        mixed_tiles = net.tile_logits(mixed, rows, slot)
+        net.fp32_heads = True
+        exact = net(batch["header"], batch["entities"], batch["valid"])
+        exact_tiles = net.tile_logits(exact, rows, slot)
+    assert mixed["type_logits"].dtype == torch.bfloat16 and mixed_tiles.dtype == torch.bfloat16
+    assert exact["type_logits"].dtype == torch.float32 and exact_tiles.dtype == torch.float32
+    torch.testing.assert_close(exact["type_logits"], mixed["type_logits"].float(), atol=0.1,
+                               rtol=0.05)
+
+
+def test_mirroring_actions_twice_gives_them_back_and_keeps_waits_abilities_and_none(data):
+    _, spec, _ = data
+    a = torch.cat([torch.arange(spec.actions), torch.tensor([-1, -2])])
+    m = spec.mirror_actions(a)
+    assert torch.equal(spec.mirror_actions(m), a)
+    assert torch.equal(m[[0, spec.first_ability, spec.first_ability + 1, -2, -1]],
+                       a[[0, spec.first_ability, spec.first_ability + 1, -2, -1]])
+    kind, tile = spec.decode(torch.tensor([1 + 2 * spec.tiles + 3 * spec.cols + 4]))
+    mk, mt = spec.decode(spec.mirror_actions(spec.encode(kind, tile)))
+    assert mk == kind and mt == 3 * spec.cols + (spec.cols - 1 - 4)
 
 
 def test_dropout_is_saved_with_the_model_and_can_be_changed(data):
@@ -214,3 +254,18 @@ def test_the_value_loss_trains_the_value_head_but_not_the_trunk(data):
             assert name not in without or not torch.equal(g, without[name])
         else:
             torch.testing.assert_close(g, without[name])
+
+
+def test_the_policy_loss_splits_exactly_into_gate_card_and_tile(data):
+    from clashai.train.bc import forward_losses, to_device
+
+    _, spec, b = data
+    torch.manual_seed(0)
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16)).eval()
+    with torch.no_grad():
+        _, s = forward_losses(net, to_device(b, "cpu"), policy_rows="all", loss_weight=0.5,
+                              metrics=True)
+    sums = s["sums"]
+    parts = sums["nll_gate"] + sums["nll_card"] + sums["nll_tile"]
+    assert parts == pytest.approx(s["policy"] * sums["w"], rel=1e-4)
+    assert sums["act_p"] > 0 and sums["act_w"] > 0

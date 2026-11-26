@@ -30,7 +30,9 @@ class NetPolicy:
     - ``tile_temperature`` and ``tile_top_p``: where the card goes. Top-p keeps the most likely
       tiles holding that share of the probability and samples among them
 
-    All at 1 is the network's own distribution. Random numbers come from the arena's generator,
+    A card or tile temperature of 0 takes the most likely card or tile; whether to play at all is
+    still drawn. All at 1 is the network's own distribution. The scores are computed in fp32
+    (``PolicyNet.fp32_heads``), so near-ties are ranked exactly. Random numbers come from the arena's generator,
     so games are reproducible.
     """
 
@@ -38,6 +40,7 @@ class NetPolicy:
                  name: str | None = None, *, card_temperature: float = 1.0,
                  tile_temperature: float = 1.0, tile_top_p: float = 1.0):
         self.net, ckpt = load_net(checkpoint, device)
+        self.net.fp32_heads = True
         self.device, self.temperature = torch.device(device), temperature
         self.card_temperature, self.tile_temperature = card_temperature, tile_temperature
         self.tile_top_p = tile_top_p
@@ -90,13 +93,13 @@ def type_probs(logits: torch.Tensor, mask: torch.Tensor, temperature: float = 1.
     """The type distribution (wait first, then each slot and ability) under ``mask``.
 
     ``card_temperature`` reshapes only the choice among the non-wait types: the wait keeps its
-    probability, and the rest shares what is left. At 1 this is the plain softmax.
+    probability, and the rest shares what is left; at 0 it all goes to the most likely open
+    card or ability. At 1 this is the plain softmax.
     """
-    probs = torch.softmax((logits / temperature).masked_fill(~mask, -1e9), -1)
+    probs = _softmax(logits, mask, temperature)
     if card_temperature == 1.0:
         return probs
-    act = torch.softmax((logits[:, 1:] / (temperature * card_temperature))
-                        .masked_fill(~mask[:, 1:], -1e9), -1)
+    act = _softmax(logits[:, 1:], mask[:, 1:], temperature * card_temperature)
     # A row whose every play is closed keeps its wait at 1.
     act = act * mask[:, 1:].any(1, keepdim=True)
     return torch.cat([probs[:, :1], (1 - probs[:, :1]) * act], 1)
@@ -105,8 +108,9 @@ def type_probs(logits: torch.Tensor, mask: torch.Tensor, temperature: float = 1.
 def tile_probs(logits: torch.Tensor, mask: torch.Tensor, temperature: float = 1.0,
                top_p: float = 1.0) -> torch.Tensor:
     """The tile distribution under ``mask``, sharpened by ``temperature`` and cut to the most
-    likely tiles holding ``top_p`` of the probability (always at least the most likely one)."""
-    probs = torch.softmax((logits / temperature).masked_fill(~mask, -1e9), -1)
+    likely tiles holding ``top_p`` of the probability (always at least the most likely one). At
+    temperature 0, the most likely open tile."""
+    probs = _softmax(logits, mask, temperature)
     if top_p >= 1.0:
         return probs
     sorted_p, order = probs.sort(-1, descending=True)
@@ -114,6 +118,15 @@ def tile_probs(logits: torch.Tensor, mask: torch.Tensor, temperature: float = 1.
     keep = torch.zeros_like(before, dtype=torch.bool).scatter(-1, order, before < top_p)
     probs = probs * keep
     return probs / probs.sum(-1, keepdim=True)
+
+
+def _softmax(logits: torch.Tensor, mask: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Softmax of ``logits / temperature`` under ``mask``; at temperature 0, all on the most
+    likely open entry (a row with none open gets all zeros)."""
+    if temperature == 0:
+        best = logits.masked_fill(~mask, float("-inf")).argmax(-1, keepdim=True)
+        return torch.zeros_like(logits).scatter(-1, best, 1.0) * mask.any(-1, keepdim=True)
+    return torch.softmax((logits / temperature).masked_fill(~mask, -1e9), -1)
 
 
 def _sample(probs: np.ndarray, rng) -> np.ndarray:
