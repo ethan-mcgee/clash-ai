@@ -55,3 +55,19 @@ def test_tile_temperature_below_one_sharpens():
     plain, sharp = tile_probs(logits, mask), tile_probs(logits, mask, temperature=0.5)
     assert (sharp.max(1).values >= plain.max(1).values).all()
     assert (sharp[~mask] == 0).all()
+
+
+def test_at_temperature_zero_card_and_tile_are_the_most_likely_and_the_wait_keeps_its_chance():
+    logits, mask = _logits()
+    plain = type_probs(logits, mask)
+    best = type_probs(logits, mask, card_temperature=0.0)
+    torch.testing.assert_close(best[:, 0], plain[:, 0])
+    torch.testing.assert_close(best.sum(1), torch.ones(len(best)))
+    top = logits[:, 1:].masked_fill(~mask[:, 1:], float("-inf")).argmax(1)
+    acts = mask[:, 1:].any(1)
+    rows = torch.arange(len(logits))[acts]
+    torch.testing.assert_close(best[rows, top[acts] + 1], 1 - plain[rows, 0])
+    assert best[0, 0] == 1  # only the wait open
+    tiles = tile_probs(logits, mask, temperature=0.0)
+    assert (tiles.sum(1) == 1).all() and (tiles.max(1).values == 1).all()
+    assert (tiles.argmax(1) == logits.masked_fill(~mask, float("-inf")).argmax(1)).all()

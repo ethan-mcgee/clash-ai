@@ -117,12 +117,15 @@ MINUTE = 1200  # ticks
 PHASES = 4  # the value's sign accuracy is reported for minutes 1, 2, 3 and overtime
 
 
-def _mirrored(spec, b: dict, mirror: float) -> tuple:
+def _mirrored(spec, b: dict, mirror: float, flip: torch.Tensor | None = None) -> tuple:
+    """The batch's inputs, mask and actions, each row reflected with probability ``mirror`` or
+    where ``flip`` (B,) bool says."""
     header, entities, valid = b["header"], b["entities"], b["valid"]
     mask = unpack_masks(b["masks"], spec.actions)
     actions = b["actions"].long()
-    if mirror > 0:
+    if flip is None and mirror > 0:
         flip = torch.rand(len(header), device=header.device) < mirror
+    if flip is not None:
         mh, me, mm, ma = spec.mirror(header, entities, valid, mask, actions)
         header = torch.where(flip[:, None], mh, header)
         entities = torch.where(flip[:, None, None], me, entities)
@@ -146,11 +149,21 @@ def value_loss(net: PolicyNet, b: dict, *, mirror: float, dropout: float) -> tup
 def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: float,
                    mirror: float = 0.0, value_weight: float = 0.1,
                    metrics: bool = False) -> tuple[torch.Tensor, dict]:
-    spec = net.spec
-    header, entities, valid, mask, actions = _mirrored(spec, b, mirror)
-
+    header, entities, valid, mask, actions = _mirrored(net.spec, b, mirror)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=header.is_cuda):
         out = net(header, entities, valid)
+    return losses(net, out, b, mask, actions, header[:, net.spec.header["tick"][0]],
+                  policy_rows=policy_rows, loss_weight=loss_weight, value_weight=value_weight,
+                  metrics=metrics)
+
+
+def losses(net: PolicyNet, out: dict, b: dict, mask: torch.Tensor, actions: torch.Tensor,
+           ticks: torch.Tensor, *, policy_rows: str, loss_weight: float, value_weight: float = 0.1,
+           metrics: bool = False) -> tuple[torch.Tensor, dict]:
+    """The losses of a batch from the network's output on it (see the module notes). ``b`` holds
+    the rows' targets and weights; ``mask`` and ``actions`` are as the network saw them."""
+    spec = net.spec
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=mask.is_cuda):
         kind, tile = spec.decode(actions)
         n = len(kind)
         ar = torch.arange(n, device=kind.device)
@@ -193,15 +206,18 @@ def forward_losses(net: PolicyNet, b: dict, *, policy_rows: str, loss_weight: fl
              "belief_hand": belief_hand.item(), "belief_next": belief_next.item()}
     if metrics:
         stats["sums"] = (_metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w,
-                              hand, known, nxt, logp, result, weight,
-                              header[:, spec.header["tick"][0]]))
+                              hand, known, nxt, logp, result, weight, ticks, nll_tile))
     return loss, stats
 
 
 @torch.no_grad()
 def _metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w, hand, known, nxt,
-             logp, result, weight, ticks) -> dict:
-    """Sums and counts, merged over validation batches by :func:`evaluate`."""
+             logp, result, weight, ticks, nll_tile) -> dict:
+    """Sums and counts, merged over validation batches by :func:`evaluate`.
+
+    The policy loss splits into three parts per decision: the gate (play or ability, against
+    wait), which card or ability given that it acts, and the tile given the card. ``act_p`` and
+    ``act_w`` compare the expected and the true number of actions (calibration)."""
     phase = torch.div(ticks.long(), MINUTE, rounding_mode="floor").clamp(max=PHASES - 1)
     decided = (result != 0).float() * weight
     right = ((out["value"].float() > 0) == (result > 0)).float() * decided
@@ -226,7 +242,18 @@ def _metrics(spec, out, type_logits, tile_logits, kind, tile, play_rows, w, hand
     top4 = logp.topk(4, -1).indices
     hand_hit = ((top4.unsqueeze(1) == hand.unsqueeze(2)).any(2) & known).sum(1).float()
     next_ok = (out["next_belief"].float().argmax(1) == nxt) & (nxt >= 0)
-    return {"n_play": play_on.sum().item(), "card_ok": card_ok.sum().item(),
+    logp_type = F.log_softmax(type_logits, -1)
+    logp_wait = logp_type[:, 0]
+    logp_act = torch.logsumexp(logp_type[:, 1:], -1)
+    gate = torch.where(act, -logp_act, -logp_wait)
+    card = torch.where(act, logp_act - logp_type.gather(1, kind[:, None]).squeeze(1),
+                       torch.zeros_like(logp_act))
+    tile_nll = torch.zeros_like(gate)
+    tile_nll[play_rows] = nll_tile.float()
+    heads = {"nll_gate": (w * gate).sum().item(), "nll_card": (w * card).sum().item(),
+             "nll_tile": (w * tile_nll).sum().item(), "act_p": (w * logp_act.exp()).sum().item(),
+             "act_w": (w * act).sum().item()}
+    return {**heads, "n_play": play_on.sum().item(), "card_ok": card_ok.sum().item(),
             "cell_ok": cell_ok.sum().item(), "cell_near": near.sum().item(),
             "w": w.sum().item(), "type_ok_w": (w * type_ok).sum().item(),
             "act_true": (on & act).sum().item(), "act_recall": (on & act & pred_act).sum().item(),
@@ -267,6 +294,8 @@ def evaluate(net, rows: Rows, indices: np.ndarray, *, policy_rows: str, loss_wei
         "value_sign_by_minute": [round(sums[f"sign_ok_{k}"] / max(1e-9, sums[f"sign_n_{k}"]), 4)
                                  for k in range(PHASES)],
         "plays": int(sums["n_play"]),
+        **{f"{k}_nll": sums[f"nll_{k}"] / max(1e-9, sums["w"]) for k in ("gate", "card", "tile")},
+        "act_calibration": sums["act_p"] / max(1e-9, sums["act_w"]),
     }
 
 
