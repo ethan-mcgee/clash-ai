@@ -66,6 +66,27 @@ Worth weighing, not copying blindly:
 Keep: tokens, the tile grid with card conditioning, card-then-tile order, the belief heads, the
 KL anchor in PPO (ppo1 drifted, and we have one GPU), and a reward of winning plus tower damage.
 
+## What generalist-v3 takes (decided 2026-11-26)
+
+We looked at seven other public Clash Royale models: FirstLight_CR, RoyaleFish, Daybreak CR, ClashAI, itzik's ClashRoyaleAi, KataCR and cochon123's. Every strong one has memory, so v3 skips the probes above and puts these into one model, trained from scratch on whole battles:
+
+| Part | Why |
+|---|---|
+| LSTM after the trunk, reading the match token and the previous own action (card, tile, decisions since we last acted) | Timing is half the loss, and one frame can't say what we just did. FirstLight, Daybreak and itzik use an LSTM |
+| Distance and relation (targets, targeted by) bias in every attention layer | FirstLight uses both; Daybreak measured a small gain |
+| fp32 scores at play time; argmax card and tile as an option | bf16 rounding reorders near-ties; play or wait stays sampled |
+
+Left out, and why:
+
+| Left out | Why |
+|---|---|
+| A delay head (0–200 ms) | Our replay play times are quantised at the source (tick offsets within a decision are uneven), and it needs an engine change |
+| Recent events | crforge doesn't export them, and the observation already shows units appearing, dying and moving |
+| Auxiliary heads | No measured gain elsewhere; the LSTM covers their purpose |
+| Weighting act rows ×8 | It would change the play rate; every decision has weight 1 instead |
+
+Each part is a setting, off in older checkpoints, so it can be switched off to diagnose a poor result. The plan, budget and go/no-go are in `docs/PLAN.md` (M3b).
+
 ## Tooling: faster scorecards
 
 Not a model change, but every idea above is judged by scorecards, so it speeds up all of them.

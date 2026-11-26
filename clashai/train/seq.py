@@ -15,6 +15,16 @@ previous actions are hidden (``--drop-prev``), so the network also learns to pla
 Rows are grouped by unit count and the trunk runs per group, then the rows go back in order for
 the core.
 
+Waits are 96% of the rows, and the trunk's backward pass is most of a step's cost. So the trunk
+learns from every play but only a seeded ``--wait-grad`` share of the waits, their gradient into
+the trunk scaled by its inverse: the same gradient in expectation, as the row trainer's sampled
+waits. The other waits go through the trunk without a gradient (and without keeping its
+activations). Every row still goes forward, in order, through the core and every head, whose
+gradients are exact.
+
+A chunk that runs out of GPU memory is skipped (logged, the lanes' states restarted); more than
+:data:`MAX_SKIPS_PER_HOUR` in an hour stops the run.
+
 Validation plays whole validation battle-seats (the row trainer's split, by tag), state carried,
 and reports the policy loss split into gate, card and tile, the play-rate calibration, and for a
 recurrent model the same loss with the state zeroed at every decision and with the previous
@@ -51,7 +61,9 @@ from .bc import EMA, losses, summary
 from .longrun import atomic_save, keep_awake, tee
 from .rows import MAX_ENTITIES, battle_rows, is_val
 
-DATASET = "dataset/all-screen-team0-v0-t0-standard"
+DATASET = "dataset/all-screen-team0-v0-t0-prefix"
+MAX_SKIPS_PER_HOUR = 20
+PASSTHROUGH = ("snapshot", "group_grad", "wait_grad")  # kept as they are by pin and to
 WIDTHS = (16, 32)  # rows with at most this many units run the trunk together; the rest in one
 
 
@@ -126,9 +138,10 @@ class Stream:
     exactly. Each chunk carries the snapshot to resume after it."""
 
     def __init__(self, battles: Battles, items: list, lanes: int, chunk: int, seed: int, *,
-                 mirror: float, drop_prev: float, snapshot: dict | None = None):
+                 mirror: float, drop_prev: float, wait_grad: float = 1.0,
+                 snapshot: dict | None = None):
         self.battles, self.items, self.lanes, self.chunk, self.seed = battles, items, lanes, chunk, seed
-        self.mirror, self.drop_prev = mirror, drop_prev
+        self.mirror, self.drop_prev, self.wait_grad = mirror, drop_prev, wait_grad
         self._cache: dict[int, dict] = {}
         self._order_cache: tuple[int, np.ndarray | None] = (-1, None)
         if snapshot is None:
@@ -178,16 +191,26 @@ class Stream:
                 take = min(need, n - ln["offset"])
                 flip = _flag(self.seed, ln["epoch"], ln["item"], 0, self.mirror)
                 drop = _flag(self.seed, ln["epoch"], ln["item"], 1, self.drop_prev)
-                parts.append((data, ln["offset"], take, ln["fresh"], flip, drop))
+                grad = None
+                if self.wait_grad < 1.0:
+                    rng = np.random.default_rng([self.seed, ln["epoch"], ln["item"], 2, ln["offset"]])
+                    acts = data["actions"][ln["offset"]:ln["offset"] + take] != 0
+                    grad = acts | (rng.random(take) < self.wait_grad)
+                parts.append((data, ln["offset"], take, ln["fresh"], flip, drop, grad))
                 ln["offset"] += take
                 ln["fresh"] = False
                 need -= take
-        return {**assemble(parts), "snapshot": self.snapshot()}
+        b = assemble(parts)
+        if self.wait_grad < 1.0:
+            b["wait_grad"] = self.wait_grad
+        return {**b, "snapshot": self.snapshot()}
 
 
 def assemble(parts: list) -> dict:
-    """Rows from (data, start, count, first, flip, drop) parts, in order, with the units grouped
-    for the trunk (``groups``: row indices, padded units, valid)."""
+    """Rows from (data, start, count, first, flip, drop[, grad]) parts, in order, with the units
+    grouped for the trunk (``groups``: row indices, padded units, valid). With ``grad`` (each
+    row's trunk gradient: the sampled waits and every play), ``grad`` and ``group_grad`` (per
+    group: whether its rows train the trunk)."""
     def cat(key):
         return np.concatenate([d[key][s:s + c] for d, s, c, *_ in parts])
 
@@ -198,7 +221,7 @@ def assemble(parts: list) -> dict:
     flip = np.zeros(n, bool)
     at = 0
     counts, ents = [], []
-    for d, s, c, fresh, f, drop in parts:
+    for d, s, c, fresh, f, drop, *_ in parts:
         first[at] = fresh
         flip[at:at + c] = f
         if drop:
@@ -210,7 +233,18 @@ def assemble(parts: list) -> dict:
         at += c
     counts = np.concatenate(counts)
     b.update(first=first, flip=flip, weight=np.ones(n, np.float32), counts=counts)
-    b["groups"] = groups(counts, ents)
+    grads = [p[6] if len(p) > 6 else None for p in parts]
+    if any(g is not None for g in grads):
+        b["grad"] = np.concatenate([np.ones(p[2], bool) if g is None else g
+                                    for p, g in zip(parts, grads, strict=True)])
+        b["groups"], b["group_grad"] = [], []
+        for flag in (True, False):
+            subset = np.flatnonzero(b["grad"] == flag)
+            for rows, units, valid in groups(counts[subset], [ents[i] for i in subset]):
+                b["groups"].append((subset[rows], units, valid))
+                b["group_grad"].append(flag)
+    else:
+        b["groups"] = groups(counts, ents)
     return b
 
 
@@ -219,7 +253,9 @@ def groups(counts: np.ndarray, ents: list) -> list:
     order = np.argsort(counts, kind="stable")
     out = []
     edges = [0, *WIDTHS, MAX_ENTITIES]
-    ints = ents[0].shape[1] if ents else 34
+    if not len(counts):
+        return out
+    ints = ents[0].shape[1]
     for lo, hi in itertools.pairwise(edges):
         rows = order[(counts[order] > lo if lo else counts[order] >= 0) & (counts[order] <= hi)]
         if not len(rows):
@@ -272,7 +308,7 @@ def pin(b: dict) -> dict:
         if k == "groups":
             out[k] = [tuple(torch.from_numpy(np.ascontiguousarray(a)).pin_memory() for a in g)
                       for g in v]
-        elif k == "snapshot":
+        elif k in PASSTHROUGH:
             out[k] = v
         else:
             out[k] = torch.from_numpy(np.ascontiguousarray(v)).pin_memory()
@@ -284,7 +320,7 @@ def to(b: dict, device) -> dict:
     for k, v in b.items():
         if k == "groups":
             out[k] = [tuple(a.to(device, non_blocking=True) for a in g) for g in v]
-        elif k == "snapshot":
+        elif k in PASSTHROUGH:
             out[k] = v
         else:
             out[k] = v.to(device, non_blocking=True)
@@ -307,8 +343,9 @@ def run(net: PolicyNet, b: dict, lanes: int, state=None, *, zero_state: bool = F
     header = torch.empty_like(b["header"])
     mask = torch.empty_like(mask_all)
     actions = torch.empty_like(actions_all)
+    group_grad = b.get("group_grad")
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=b["header"].is_cuda):
-        for rows, units, valid in b["groups"]:
+        for i, (rows, units, valid) in enumerate(b["groups"]):
             rows = rows.long()
             h, m, a = b["header"][rows], mask_all[rows], actions_all[rows]
             mh, mu, mm, ma = spec.mirror(h, units, valid, m, a)
@@ -317,7 +354,18 @@ def run(net: PolicyNet, b: dict, lanes: int, state=None, *, zero_state: bool = F
             units = torch.where(f[:, None, None], mu, units)
             header[rows], mask[rows] = h, torch.where(f[:, None], mm, m)
             actions[rows] = torch.where(f, ma, a)
-            parts.append((rows, net.encode(h, units, valid)))
+            if group_grad is not None and not group_grad[i]:
+                with torch.no_grad():  # unsampled waits: forward only
+                    enc = net.encode(h, units, valid)
+            else:
+                enc = net.encode(h, units, valid)
+                if group_grad is not None and torch.is_grad_enabled():
+                    # Sampled waits' gradient into the trunk scaled up by the inverse of the
+                    # sampling share (plays' kept as is); the forward value is unchanged.
+                    up = torch.where(a != 0, 1.0, 1.0 / b["wait_grad"]).to(enc["trunk"].dtype)
+                    x = enc["trunk"]
+                    enc = {**enc, "trunk": x.detach() + (x - x.detach()) * up[:, None, None]}
+            parts.append((rows, enc))
             rows_all.append(rows)
         fixed = parts[0][1]["fixed"]
         width = max(p["trunk"].shape[1] for _, p in parts)
@@ -457,12 +505,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--evaluate", help="only score this checkpoint on the validation battles")
     p.add_argument("--resume", action="store_true", help="carry on from last.pt if there is one")
     p.add_argument("--init", help="a checkpoint to start from (default: a new network)")
-    p.add_argument("--lanes", type=int, default=64, help="battle-seats per step")
+    p.add_argument("--lanes", type=int, default=128, help="battle-seats per step")
     p.add_argument("--chunk", type=int, default=32, help="consecutive decisions per lane a step")
     p.add_argument("--passes", type=float, default=3.0, help="passes over the training decisions")
     p.add_argument("--steps", type=int, default=0, help="steps (default: from --passes)")
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--warmup", type=int, default=3000)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup", type=int, default=1500)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--value-weight", type=float, default=0.1)
@@ -470,7 +518,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--mirror", type=float, default=0.5)
     p.add_argument("--drop-prev", type=float, default=0.1,
                    help="share of battle-seats whose previous actions are hidden")
-    p.add_argument("--ema", type=float, default=0.9995)
+    p.add_argument("--wait-grad", type=float, default=0.1,
+                   help="share of waits whose gradient trains the trunk (1: all)")
+    p.add_argument("--ema", type=float, default=0.999)
     p.add_argument("--d", type=int, default=384)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--heads", type=int, default=6)
@@ -555,7 +605,7 @@ def main(argv: list[str] | None = None) -> None:
                              {"params": other, "weight_decay": 0.0}], lr=args.lr,
                             betas=(0.9, 0.98), fused=True)
     ema = EMA(net, args.ema) if args.ema else None
-    step, best, stale = 0, math.inf, 0
+    step, best, stale, plays_seen = 0, math.inf, 0, 0
     state = None
     snapshot = None
     if resumed:
@@ -563,6 +613,7 @@ def main(argv: list[str] | None = None) -> None:
         if ema:
             ema.net.load_state_dict(resumed["model"])
         step, best, stale = resumed["step"], resumed["best"], resumed["stale"]
+        plays_seen = resumed.get("plays_seen", 0)
         snapshot = resumed["stream"]
         if resumed["lstm_state"] is not None:
             state = tuple(s.to(device) for s in resumed["lstm_state"])
@@ -576,7 +627,7 @@ def main(argv: list[str] | None = None) -> None:
         return args.lr * (0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * min(1.0, t))))
 
     stream = Stream(battles, train_items, args.lanes, args.chunk, args.seed, mirror=args.mirror,
-                    drop_prev=args.drop_prev, snapshot=snapshot)
+                    drop_prev=args.drop_prev, wait_grad=args.wait_grad, snapshot=snapshot)
     loader = Loader(stream)
     consumed = snapshot
 
@@ -588,12 +639,13 @@ def main(argv: list[str] | None = None) -> None:
                      "optimizer": opt.state_dict(), "stream": consumed,
                      "lstm_state": None if state is None else tuple(s.cpu() for s in state),
                      "rng": {"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state()},
-                     "best": best, "stale": stale, "metrics": m}, last)
+                     "best": best, "stale": stale, "plays_seen": plays_seen, "metrics": m}, last)
 
     log = out / "metrics.jsonl"
     t0 = time.time()
     saved = tick = time.time()
     waited, running, seen = 0.0, {}, 0
+    skips: list[float] = []
     try:
         while step <= steps:
             if step % args.eval_every == 0 or step == steps:
@@ -601,7 +653,8 @@ def main(argv: list[str] | None = None) -> None:
                 t = time.time()
                 m = validate(judged, battles, val_items, device, **common)
                 m.update(step=step, minutes=round((time.time() - t0) / 60, 1),
-                         passes=round(step / per_pass, 3),
+                         passes=round(step / per_pass, 3), plays_seen=plays_seen,
+                         skipped_chunks=len(skips),
                          train={k: v / max(1, running.get("_n", 1)) for k, v in running.items()
                                 if k != "_n"},
                          max_memory_gb=round(torch.cuda.max_memory_allocated() / 2**30, 2))
@@ -631,12 +684,30 @@ def main(argv: list[str] | None = None) -> None:
             b = loader.next()
             waited += time.perf_counter() - t
             consumed = b["snapshot"]
+            plays = int((b["actions"] != 0).sum())
             b = to(b, device)
-            loss, s, new_state = chunk_losses(net, b, args.lanes, state, **common)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            try:
+                loss, s, new_state = chunk_losses(net, b, args.lanes, state, **common)
+                loss.backward()
+            except torch.OutOfMemoryError:
+                loss = s = new_state = None
+                opt.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                state = None  # the lanes go on from zero state
+                now = time.time()
+                skips.append(now)
+                recent = sum(now - x < 3600 for x in skips)
+                print(f"  step {step}: out of GPU memory, chunk skipped ({len(skips)} so far, "
+                      f"{recent} in the last hour)", flush=True)
+                if recent > MAX_SKIPS_PER_HOUR:
+                    save(None)
+                    raise RuntimeError(f"{recent} chunks ran out of GPU memory within an hour; "
+                                       "last.pt holds the run up to here") from None
+                continue
             torch.nn.utils.clip_grad_norm_([q for g in opt.param_groups for q in g["params"]], 1.0)
             opt.step()
+            plays_seen += plays
             if ema:
                 ema.update(net, step)
             state = None if new_state is None else tuple(x.detach() for x in new_state)
