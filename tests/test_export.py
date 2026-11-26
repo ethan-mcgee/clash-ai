@@ -47,3 +47,24 @@ def test_an_exported_policy_matches_pytorch_and_carries_crforges_metadata(tmp_pa
     open_first = spec.type_mask(torch.from_numpy(masks)).numpy()
     assert np.array_equal(first > CLOSED / 10, open_first)
     np.testing.assert_allclose(np.exp(first).sum(1), 1, rtol=1e-4)
+
+
+def test_a_model_with_attention_biases_exports_and_matches_pytorch(tmp_path):
+    from clashai.export.onnx import compare, export, sample_rows
+
+    metadata = json.loads((ROWS / "metadata.json").read_text())
+    spec = Spec.from_metadata(metadata)
+    torch.manual_seed(0)
+    net = PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16, attn_bias=True,
+                                 relations=True))
+    with torch.no_grad():  # weights away from their zero start, so the biases matter
+        for mlp in net.pair_mlp:
+            mlp[2].weight.normal_(0, 0.5)
+        net.relation_bias.normal_(0, 0.5)
+    ckpt = tmp_path / "biased.pt"
+    torch.save({"model": net.state_dict(), "description": net.describe(), "step": 0,
+                "metadata": metadata}, ckpt)
+    obs, masks = sample_rows(ROWS, 64)
+    path = export(ckpt, tmp_path / "biased.onnx", example=(obs[:4], masks[:4]))
+    d = compare(path, ckpt, obs, masks, device="cpu")
+    assert d["first_logp"] < 1e-4 and d["tile_logp"] < 1e-4 and d["value"] < 1e-4
