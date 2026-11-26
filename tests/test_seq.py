@@ -171,3 +171,85 @@ def test_sampling_the_trunks_waits_changes_no_output_and_no_gradient_after_the_t
             torch.testing.assert_close(grads[1][n], grads[0][n], rtol=1e-5, atol=1e-6, msg=n)
     trunk = "trunk.layers.0.linear1.weight"
     assert not torch.allclose(grads[1][trunk], grads[0][trunk])  # fewer waits, scaled up
+
+
+def _packed_pair(battles, profiles):
+    """The same chunk from two streams: grouped by its rows, and packed into ``profiles``."""
+    from clashai.train.seq import Stream
+
+    items = battles.items(False, 12)
+    common = {"mirror": 0.5, "drop_prev": 0.3, "wait_grad": 0.1}
+    return (Stream(battles, items, 4, 48, 7, **common).next(),
+            Stream(battles, items, 4, 48, 7, **common, profiles=profiles).next())
+
+
+def test_a_packed_chunk_has_its_profiles_shapes_and_places_every_row_once(battles):
+    from clashai.train.seq import Profile
+
+    small = Profile((8, 8, 8), (16, 16, 16), 4)  # 72 places for 192 rows: never fits
+    roomy = Profile((64, 48, 32), (192, 96, 64), 40)
+    free, packed = _packed_pair(battles, (small, roomy))
+    assert packed["packed"] == 1
+    n = len(packed["actions"])
+    sizes = [len(g[0]) for g in packed["groups"]]
+    assert sizes == [*roomy.grad, *roomy.plain]
+    assert [g[1].shape[1] for g in packed["groups"]] == [16, 32, 80, 16, 32, 80]
+    assert packed["group_grad"] == [True] * 3 + [False] * 3
+    # Each row sits at its place, in a group wide enough for its units and of its gradient flag.
+    rows = np.concatenate([g[0] for g in packed["groups"]])
+    np.testing.assert_array_equal(rows[packed["inverse"]], np.arange(n))
+    assert len(set(packed["inverse"].tolist())) == n
+    start = 0
+    for (r, units, valid), flag in zip(packed["groups"], packed["group_grad"], strict=True):
+        mine = packed["inverse"][(packed["inverse"] >= start) & (packed["inverse"] < start + len(r))]
+        real = r[mine - start]
+        assert (packed["grad"][real] == flag).all()
+        assert (packed["counts"][real] <= units.shape[1]).all()
+        np.testing.assert_array_equal(valid[mine - start].sum(1), packed["counts"][real])
+        spare = np.setdiff1d(np.arange(len(r)), mine - start)
+        assert not valid[spare].any() and not r[spare].any()
+        start += len(r)
+    plays = np.flatnonzero((packed["actions"] > 0)
+                           & (packed["actions"] < battles.spec.first_ability))
+    assert len(packed["play_rows"]) == 40 and packed["play_on"].sum() == len(plays)
+    np.testing.assert_array_equal(packed["play_rows"][packed["play_on"]], plays)
+    # The rows themselves are untouched, and a chunk that fits no profile is grouped as usual.
+    same = ("header", "masks", "actions", "first", "flip", "prev_action", "counts", "grad")
+    _same({k: packed[k] for k in same}, {k: free[k] for k in same})
+    _, unfit = _packed_pair(battles, (small,))
+    assert unfit["packed"] == -1 and "inverse" not in unfit
+    _same({k: v for k, v in unfit.items() if k != "packed"}, free)
+
+
+def test_a_packed_chunk_with_the_core_run_by_step_trains_as_the_chunk_grouped_by_its_rows(battles):
+    """The step of fixed shapes computes the same loss, state and gradients as the usual one."""
+    from clashai.train.seq import Profile, chunk_losses, pin
+
+    free, packed = (pin(b) for b in _packed_pair(battles, (Profile((64, 48, 32), (192, 96, 64), 40),)))
+    assert packed["packed"] == 0
+    torch.manual_seed(0)
+    net = PolicyNet(battles.spec, Config(d=64, layers=2, heads=4, grid_channels=16,
+                                         attn_bias=True, relations=True, lstm=32,
+                                         prev_action=True)).train()  # dropout 0
+    g = torch.Generator().manual_seed(3)
+    state = tuple(torch.randn(1, 4, 32, generator=g) for _ in range(2))
+    got = []
+    for b, by_step, sync in ((free, False, True), (packed, True, False)):
+        net.core_steps = by_step
+        net.zero_grad()
+        loss, stats, new_state = chunk_losses(net, b, 4, state, loss_weight=0.5,
+                                              value_weight=0.1, sync=sync)
+        loss.backward()
+        got.append((loss.detach(), stats, new_state,
+                    {n: q.grad.clone() for n, q in net.named_parameters() if q.grad is not None}))
+    (loss_a, stats_a, state_a, grads_a), (loss_b, stats_b, state_b, grads_b) = got
+    torch.testing.assert_close(loss_b, loss_a, rtol=1e-5, atol=1e-6)
+    assert all(isinstance(v, float) for v in stats_a.values())
+    for k, v in stats_b.items():  # left as tensors, read later
+        assert isinstance(v, torch.Tensor) and not v.requires_grad
+        assert abs(v.item() - stats_a[k]) < 1e-5, k
+    for x, y in zip(state_a, state_b, strict=True):
+        torch.testing.assert_close(y, x, rtol=1e-4, atol=1e-5)
+    assert grads_a.keys() == grads_b.keys()
+    for name in grads_a:
+        torch.testing.assert_close(grads_b[name], grads_a[name], rtol=2e-3, atol=2e-6, msg=name)

@@ -286,6 +286,11 @@ class PolicyNet(nn.Module):
     # -- forward -------------------------------------------------------------------------------
 
     fp32_heads: bool = False
+    core_steps: bool = False
+    """Run the recurrent core one decision at a time, with fixed control flow (see
+    :meth:`_core_by_step`), instead of in segments cut at restarts. A way of running the same
+    weights, not part of the model: for CUDA graphs and ``torch.compile``, which need the same
+    operations whatever the data."""
     """Run everything after the trunk in fp32 even under bf16 autocast: the type and tile scores
     are then exact enough to rank, which matters when sampling sharpened or taking the most likely
     card and tile. Not part of the configuration: a play-time choice (NetPolicy sets it)."""
@@ -380,20 +385,42 @@ class PolicyNet(nn.Module):
             c = x.new_zeros(1, lanes, width)
         else:
             h, c = (s.to(x.dtype) for s in memory["state"])
-        # Run in segments, cut wherever some lane restarts, so a restart is always a segment's
-        # first step and nn.LSTM runs each segment whole.
-        cuts = [0, *(torch.nonzero(first[:, 1:].any(0)).squeeze(1) + 1).tolist(), steps]
-        ys = []
-        for a, b in itertools.pairwise(cuts):
-            keep = (~first[:, a]).to(x.dtype)[None, :, None]
-            y, (h, c) = self.core(x[:, a:b], (h * keep, c * keep))
-            ys.append(y)
-        y = torch.cat(ys, 1).reshape(n, width)
+        if self.core_steps:
+            y, (h, c) = self._core_by_step(x, first, h, c)
+        else:
+            # Run in segments, cut wherever some lane restarts, so a restart is always a
+            # segment's first step and nn.LSTM runs each segment whole.
+            cuts = [0, *(torch.nonzero(first[:, 1:].any(0)).squeeze(1) + 1).tolist(), steps]
+            ys = []
+            for a, b in itertools.pairwise(cuts):
+                keep = (~first[:, a]).to(x.dtype)[None, :, None]
+                y, (h, c) = self.core(x[:, a:b], (h * keep, c * keep))
+                ys.append(y)
+            y = torch.cat(ys, 1)
+        y = y.reshape(n, width)
         add = self.core_out(y).view(n, 3, -1)
         match = self.core_norm[0](match + add[:, 0])
         hand = self.core_norm[1](hand + add[:, 1, None])
         ability = self.core_norm[2](ability + add[:, 2, None])
         return match, hand, ability, (h, c)
+
+    def _core_by_step(self, x, first, h, c):
+        """The LSTM over (lanes, steps, width) written out a step at a time from its own weights,
+        the state zeroed wherever ``first``: the same numbers as nn.LSTM in segments, with no
+        operation that depends on where the restarts fall."""
+        core = self.core
+        pre = F.linear(x, core.weight_ih_l0, core.bias_ih_l0 + core.bias_hh_l0)
+        keep = (~first).to(x.dtype)
+        h, c = h[0], c[0]
+        ys = []
+        for t in range(x.shape[1]):
+            k = keep[:, t, None]
+            h, c = h * k, c * k
+            i, f, g, o = (pre[:, t] + F.linear(h, core.weight_hh_l0)).chunk(4, 1)
+            c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+            h = torch.sigmoid(o) * torch.tanh(c)
+            ys.append(h)
+        return torch.stack(ys, 1), (h[None], c[None])
 
     def _pairs(self, entities: torch.Tensor, valid: torch.Tensor) -> dict:
         """What every layer's attention bias reads, computed once in fp32: for each pair of units

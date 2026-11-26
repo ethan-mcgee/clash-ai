@@ -94,6 +94,39 @@ def test_a_restart_inside_a_chunk_equals_starting_that_lane_afresh(data):
 
 
 @needs_rows
+def test_the_core_a_step_at_a_time_equals_the_core_in_segments(data):
+    """``core_steps`` is another way to run the same weights: with restarts in several lanes at
+    different places and a carried state, the outputs, the state and the gradients match."""
+    spec, b = data
+    net = _net(spec).train()
+    net.set_dropout(0.0)
+    lanes, steps = 4, 16
+    first = torch.zeros(lanes, steps, dtype=torch.bool)
+    first[0, 0] = first[1, 5] = first[2, 5] = first[2, 11] = first[3, 15] = True
+    g = torch.Generator().manual_seed(1)
+    state = tuple(torch.randn(1, lanes, 32, generator=g) for _ in range(2))
+    memory = _memory(64, lanes, first.reshape(-1), state)
+    grads = []
+    outs = []
+    for by_step in (False, True):
+        net.core_steps = by_step
+        net.zero_grad()
+        out = net(b["header"], b["entities"], b["valid"], memory)
+        (out["type_logits"].square().mean() + out["value"].sum()
+         + sum(x.sum() for x in out["state"])).backward()
+        outs.append(out)
+        grads.append({n: q.grad.clone() for n, q in net.named_parameters() if q.grad is not None})
+    net.core_steps = False
+    for key in ("type_logits", "value", "match", "hand"):
+        assert torch.allclose(outs[0][key], outs[1][key], atol=1e-5), key
+    for a, c in zip(outs[0]["state"], outs[1]["state"], strict=True):
+        assert torch.allclose(a, c, atol=1e-5)
+    assert grads[0].keys() == grads[1].keys()
+    for name in grads[0]:
+        assert torch.allclose(grads[0][name], grads[1][name], atol=1e-5), name
+
+
+@needs_rows
 def test_the_core_and_the_previous_action_learn_through_the_policy_loss(data):
     from clashai.model.spec import unpack_masks
     from clashai.train.bc import losses

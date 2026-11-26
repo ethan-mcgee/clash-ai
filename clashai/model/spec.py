@@ -99,9 +99,12 @@ class Spec:
 
     def mirror(self, header, entities, valid, mask, actions):
         """Each row reflected left to right (see clashai.sim.mirror for the rule); new tensors."""
-        header, entities = header.clone(), entities.clone()
-        w = self.width
-        h, e = self.header, self.entity
+        return (self.mirror_header(header), self.mirror_entities(entities, valid),
+                self.mirror_mask(mask), self.mirror_actions(actions))
+
+    def mirror_header(self, header: torch.Tensor) -> torch.Tensor:
+        header = header.clone()
+        w, h = self.width, self.header
         pend_x, pend_card = h["pending_x"], h["pending_card"]
         header[:, pend_x] = torch.where(header[:, pend_card] >= 0, w - header[:, pend_x],
                                         header[:, pend_x])
@@ -111,6 +114,11 @@ class Spec:
         for left, right in TOWER_SWAP:
             a, b = h[left][0], h[right][0]
             header[:, [a, b]] = header[:, [b, a]]
+        return header
+
+    def mirror_entities(self, entities: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        entities = entities.clone()
+        w, e = self.width, self.entity
         x, tx, ax, ay = e["x"], e["target_x"], e["aim_x"], e["aim_y"]
         entities[..., x] = torch.where(valid, w - entities[..., x], entities[..., x])
         has_target = valid & (entities[..., e["target"]] >= 0)
@@ -118,10 +126,12 @@ class Spec:
         aimed = valid & ((entities[..., ax] != 0) | (entities[..., ay] != 0)) & (entities[..., ax] != -1)
         entities[..., ax] = torch.where(aimed, w - entities[..., ax], entities[..., ax])
         entities[..., e["dx"]] = torch.where(valid, -entities[..., e["dx"]], entities[..., e["dx"]])
+        return entities
+
+    def mirror_mask(self, mask: torch.Tensor) -> torch.Tensor:
         plays = mask[:, 1:self.first_ability].view(-1, self.hand_slots, self.rows, self.cols)
-        mask = torch.cat([mask[:, :1], plays.flip(-1).reshape(len(mask), -1),
+        return torch.cat([mask[:, :1], plays.flip(-1).reshape(len(mask), -1),
                           mask[:, self.first_ability:]], 1)
-        return header, entities, mask, self.mirror_actions(actions)
 
     def mirror_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """Each action reflected left to right: a play's tile column flips; others are kept.
