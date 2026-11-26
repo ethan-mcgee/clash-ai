@@ -107,26 +107,45 @@ def _java_major(home: Path) -> int | None:
     return None
 
 
+def jdk_roots() -> list[Path]:
+    """Folders JDKs are installed under: Temurin's on Windows, the distribution's on Linux."""
+    if os.name == "nt":
+        return [Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Eclipse Adoptium"]
+    return [Path("/usr/lib/jvm")]
+
+
+def installed_jdks() -> list[Path]:
+    """Every JDK folder under :func:`jdk_roots`, newest name first. Links to the same JDK (Ubuntu
+    keeps two names for each) are listed once."""
+    found: dict[Path, Path] = {}
+    for root in jdk_roots():
+        if root.is_dir():
+            for home in sorted(root.iterdir(), reverse=True):
+                if home.is_dir():
+                    found.setdefault(home.resolve(), home)
+    return list(found.values())
+
+
 def ensure_java() -> Path:
     """Points ``JAVA_HOME`` at a JDK 21 before JPype starts the JVM, and returns it.
 
     crforge is built and tested on Java 21. This machine's user ``JAVA_HOME`` names Java 25, and
     JPype starts whatever ``JAVA_HOME`` names, so it is set here explicitly: ``CLASHAI_JAVA_HOME``
-    when given, else ``JAVA_HOME`` when it is already 21, else the newest Temurin 21 installed.
+    when given, else ``JAVA_HOME`` when it is already 21, else the newest JDK 21 installed where
+    the system keeps them (:func:`installed_jdks`).
     """
     candidates: list[Path] = []
     if os.environ.get("CLASHAI_JAVA_HOME"):
         candidates.append(Path(os.environ["CLASHAI_JAVA_HOME"]))
     if os.environ.get("JAVA_HOME"):
         candidates.append(Path(os.environ["JAVA_HOME"]))
-    adoptium = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Eclipse Adoptium"
-    if adoptium.is_dir():
-        candidates += sorted(adoptium.glob("jdk-21*"), reverse=True)
+    candidates += installed_jdks()
     for home in candidates:
         if _java_major(home) == 21:
             os.environ["JAVA_HOME"] = str(home)
             return home
-    raise RuntimeError("no JDK 21 found: install Temurin 21 or set CLASHAI_JAVA_HOME")
+    raise RuntimeError("no JDK 21 found: install one (Temurin 21 on Windows, openjdk-21-jdk on "
+                       "Linux) or set CLASHAI_JAVA_HOME")
 
 
 CPU_CAP = 16

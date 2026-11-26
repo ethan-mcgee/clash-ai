@@ -113,3 +113,34 @@ Play against it in crforge's visualizer, from `third_party\crforge` (`JAVA_HOME`
 ```
 
 `--model-sample` draws the model's moves from its probabilities. Without it the model takes its most likely move, which is nearly always a wait. A headless check of a model file: `.\gradlew.bat --no-daemon :desktop:test --tests "*ModelOpponentTest*" "-Pcrforge.modelFile=<file.onnx>"` with the same properties.
+
+## Linux (WSL)
+
+The project also runs in a WSL 2 instance of its own, `clash-ai` (Ubuntu 24.04), whose disk is on D: (`D:\wsl\clash-ai`). It exists for `torch.compile`, which PyTorch supports on Linux and not on native Windows. The Windows setup above stays the reference; D: holds the master copy of all data.
+
+| What | Where in the instance |
+|---|---|
+| This repo | `~/clash-ai`, on the instance's own disk (not under `/mnt/c`, which is slow and synced by OneDrive) |
+| Data root | `/data/clash-ai` (`CLASHAI_DATA`), with the same layout as `D:\ml-data\clash-ai` |
+| Python venv | `/data/clash-ai/venv`: the Windows environment's versions (PyTorch 2.5.1 CUDA 12.4, NumPy 2.5.5, JPype 1.7.1) |
+| JDK | `openjdk-21-jdk-headless`; `clashai` finds it under `/usr/lib/jvm` |
+| Environment | `~/.clashai-env`, read by login shells: `CLASHAI_DATA`, `CLASHAI_JAVA_HOME` and the venv on `PATH` |
+
+Set-up, from Windows:
+
+```powershell
+wsl --install Ubuntu-24.04 --name clash-ai --location D:\wsl\clash-ai --no-launch
+```
+
+then, inside the instance: `apt-get install openjdk-21-jdk-headless python3.12-venv python3-pip git rsync build-essential tmux`, the venv, `pip install -e . -e third_party/crforge/python`, and `rsync` of the data it needs from `/mnt/d/ml-data/clash-ai` (the game tables, the Gradle home, checkpoints and the training dataset; the replay conversion and labelling intermediates stay on Windows).
+
+- **The GPU needs nothing installed.** WSL passes the Windows NVIDIA driver through, and the PyTorch wheel brings its own CUDA libraries.
+- **Read data from the instance's disk.** Windows drives are reached through a bridge (`/mnt/d`) that is slow for the dataset's 125,000 small files.
+- **The engine plays the same games.** 208 seeded games (scripted and random pilots against scripted, 13 decks) end with the same scores, crowns and tick counts on Windows and in WSL. Models on the GPU are not bit-identical across systems, so a paired comparison runs wholly on one of them.
+- **Long jobs start from Windows**, because a process in WSL cannot stop Windows from sleeping. `scripts\wsl-run.ps1` holds the wake lock on the Windows side while the job runs:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File scripts\wsl-run.ps1 -Name my-run -Command "python -m clashai.train.bc --name my-run --resume"
+  wsl -d clash-ai -- tail -f /data/clash-ai/runs/wsl-my-run.log
+  powershell -ExecutionPolicy Bypass -File scripts\wsl-run.ps1 -Name my-run -Stop
+  ```
