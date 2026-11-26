@@ -374,7 +374,6 @@ class PolicyNet(nn.Module):
         if self.config.prev_action:
             x = torch.cat([match, self._prev_embedding(memory).to(match.dtype)], -1)
         x = self.core_in(x)
-        self.core.flatten_parameters()  # copies (the EMA's) leave cuDNN's weight block split
         lanes = int(memory["lanes"])
         n, width = x.shape
         steps = n // lanes
@@ -390,6 +389,7 @@ class PolicyNet(nn.Module):
         else:
             # Run in segments, cut wherever some lane restarts, so a restart is always a
             # segment's first step and nn.LSTM runs each segment whole.
+            self.core.flatten_parameters()  # copies (the EMA's) leave cuDNN's weights split
             cuts = [0, *(torch.nonzero(first[:, 1:].any(0)).squeeze(1) + 1).tolist(), steps]
             ys = []
             for a, b in itertools.pairwise(cuts):

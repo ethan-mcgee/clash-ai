@@ -59,6 +59,7 @@ from ..model.net import Config, PolicyNet
 from ..model.policy import load_net
 from ..model.spec import Spec, unpack_masks
 from .bc import EMA, losses, summary
+from .graphed import MODES, Stepper
 from .longrun import atomic_save, keep_awake, tee
 from .rows import MAX_ENTITIES, battle_rows, is_val
 
@@ -627,6 +628,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--val-on-train", action="store_true",
                    help="validate on the training battles (with --limit-battles: an overfit check)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--graph", choices=MODES, default="off",
+                   help="how a step runs: off, a recorded CUDA graph, or torch.compile (Linux)")
     args = p.parse_args(argv)
 
     out = paths.runs_dir() / "seq" / args.name
@@ -712,8 +715,12 @@ def main(argv: list[str] | None = None) -> None:
         t = (s - args.warmup) / max(1, steps - args.warmup)
         return args.lr * (0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * min(1.0, t))))
 
+    profiles = default_profiles(rows_per_step) if args.graph != "off" else ()
     stream = Stream(battles, train_items, args.lanes, args.chunk, args.seed, mirror=args.mirror,
-                    drop_prev=args.drop_prev, wait_grad=args.wait_grad, snapshot=snapshot)
+                    drop_prev=args.drop_prev, wait_grad=args.wait_grad, snapshot=snapshot,
+                    profiles=profiles)
+    stepper = Stepper(net, opt, ema, args.lanes, mode=args.graph, loss_weight=args.loss_weight,
+                      value_weight=args.value_weight)
     loader = Loader(stream)
     consumed = snapshot
 
@@ -741,8 +748,8 @@ def main(argv: list[str] | None = None) -> None:
                 m.update(step=step, minutes=round((time.time() - t0) / 60, 1),
                          passes=round(step / per_pass, 3), plays_seen=plays_seen,
                          skipped_chunks=len(skips),
-                         train={k: v / max(1, running.get("_n", 1)) for k, v in running.items()
-                                if k != "_n"},
+                         train={k: float(v) / max(1, running.get("_n", 1))
+                                for k, v in running.items() if k != "_n"},
                          max_memory_gb=round(torch.cuda.max_memory_allocated() / 2**30, 2))
                 running = {}
                 with open(log, "a", encoding="utf-8") as f:
@@ -764,20 +771,16 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"stopping early: no better validation loss in {stale} validations",
                           flush=True)
                     break
-            for g in opt.param_groups:
-                g["lr"] = lr_at(step)
             t = time.perf_counter()
             b = loader.next()
             waited += time.perf_counter() - t
             consumed = b["snapshot"]
             plays = int((b["actions"] != 0).sum())
             b = to(b, device)
-            opt.zero_grad(set_to_none=True)
             try:
-                loss, s, new_state = chunk_losses(net, b, args.lanes, state, **common)
-                loss.backward()
+                s, new_state = stepper.step(b, state, lr=lr_at(step), at=step)
             except torch.OutOfMemoryError:
-                loss = s = new_state = None
+                s = new_state = None
                 opt.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 state = None  # the lanes go on from zero state
@@ -791,23 +794,24 @@ def main(argv: list[str] | None = None) -> None:
                     raise RuntimeError(f"{recent} chunks ran out of GPU memory within an hour; "
                                        "last.pt holds the run up to here") from None
                 continue
-            torch.nn.utils.clip_grad_norm_([q for g in opt.param_groups for q in g["params"]], 1.0)
-            opt.step()
             plays_seen += plays
-            if ema:
-                ema.update(net, step)
-            state = None if new_state is None else tuple(x.detach() for x in new_state)
+            state = new_state
             step += 1
             seen += rows_per_step
-            for k, v in s.items():
+            for k, v in s.items():  # tensors, read when printed
                 running[k] = running.get(k, 0.0) + v
             running["_n"] = running.get("_n", 0) + 1
             if step % 200 == 0:
                 now = time.time()
-                print(f"  step {step} loss {s['loss']:.4f} policy {s['policy']:.4f} "
+                done = stepper.counts
+                recorded = "" if args.graph != "cuda" else \
+                    f", recorded steps {done['recorded'] / max(1, sum(done.values())):.0%}"
+                print(f"  step {step} loss {float(s['loss']):.4f} policy {float(s['policy']):.4f} "
                       f"({seen / (now - tick):,.0f} rows/s, waiting for data "
-                      f"{waited / max(1e-9, now - tick):.0%}, lr {lr_at(step):.2e})", flush=True)
+                      f"{waited / max(1e-9, now - tick):.0%}, lr {lr_at(step):.2e}{recorded})",
+                      flush=True)
                 waited, seen, tick = 0.0, 0, now
+                stepper.counts = dict.fromkeys(done, 0)
             if time.time() - saved > args.checkpoint_minutes * 60:
                 save(None)
                 saved = time.time()
