@@ -132,8 +132,19 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
   - Loss: PPO's clipped surrogate, a value loss whose gradient reaches the shared trunk at 0.1, entropy 0.001, and KL 0.05 to the generalist on the learner's own decisions. The first 5 iterations train the critic alone.
   - crforge gained `set_decks`, so a battle can play a new opponent deck after every game (`docs/CRFORGE.md`).
   - Speed: an iteration is 512 battles x 128 decisions in about 50 s, about 4,000 games an hour.
-- Still to do: the exploiter pilot, promotion gates, and a held-out pilot for the exit test (the generalist pilots both training and evaluation games for now).
+- Still to do: the exploiter pilot and promotion gates.
 - Exit: on held-out decks and pilots, the PPO specialist beats the imitation specialist with an interval clear of 50%, and behaviour metrics stay near human ranges.
+- Exit test (`python -m clashai.eval.exit_test`, designed 2026-11-26, checks fixed before any result):
+  - Candidate: the PPO run's `best.pt`. Baseline: the strongest imitation model, generalist-v2. The M2 specialist never beat the generalist.
+  - Every model samples at card 0.7, tile 0.3, the best setting of the temperature sweep for all three models.
+  - Held-out decks: the 20 most played held-out decks in the November replays, with their recorded slot flags (`clashai/eval/deck_sets.py`, `<data>/eval/exit-decks.json`). The league never draws a held-out deck.
+  - Held-out pilot: the old generalist, which no ppo2 game used. Training pilot: the run's reference (generalist-v2), reported but not required.
+  - Seeds from 1,500,000, clear of the in-run scorecards and the sweep. 50 seeds × 2 seats per deck (2,000 games a scorecard); the mirror 200 seeds (400 games).
+  - A (required): candidate minus baseline against the held-out decks and pilot, paired game by game, 95% interval above 0.
+  - B (reported): the same against the training pilot.
+  - C (required): the candidate beats the baseline in the Piggies EQ mirror, 95% interval above 50%.
+  - D (required): behaviour (`clashai/eval/behaviour.py`). The candidate's median game is inside the 10th–90th percentile of 2,405 human Piggies EQ games for plays per minute, abilities per minute, share of decisions at full elixir and time of the first play. Each card is played at between half and twice its human share.
+  - Report and numbers under `<data>/runs/exit`.
 
 **M4. Search**
 - Exit: measured win-rate gain and decision latency.
