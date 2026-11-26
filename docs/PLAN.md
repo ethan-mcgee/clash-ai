@@ -153,14 +153,21 @@ What it does **not** give us: it can't read our replay dataset directly. Its rep
   3. an LSTM core with the previous own action;
   4. the whole-battle trainer `clashai/train/seq.py`;
   5. stateful play in the arena.
-- The run trains from scratch on every decision of the 107k labelled battles, 64 battle-seats × 32 decisions a step.
-  - Model: 17.5M parameters, d 384, 6 layers, LSTM 512, about 5,800 rows/s.
-  - 3 passes is about 264k steps, **about 30 hours** with validations.
+- The run trains from scratch on every decision of the 125,612 battles of the `prefix` filter (`docs/DATA.md`), battle-seats × 32 decisions a step.
+  - Model: 17.5M parameters, d 384, 6 layers, LSTM 512.
+  - Every play and a seeded 10% of the waits train the trunk, the waits' gradient scaled ×10; the core and heads learn from every decision. Peak GPU memory fell from 14.6 GB to 3.5 GB at 64 lanes (6.5 GB at 128), and a chunk that still runs out is skipped.
+  - Measured while a labelling run shared the CPU: 6,200 rows/s at 64 lanes, 9,300 at 128. Each step has about 120 ms of fixed overhead (many small GPU launches), so wider steps run faster.
+  - Validation every 8,000 steps at 64 lanes (about 95 s each).
   - Started hidden, it checkpoints every 15 minutes, and the same command resumes it after a stop or a reboot.
-- Baseline on the same whole-battle validator: generalist-v2 scores 0.2354 (gate 0.1190, card 0.0270, tile 0.0894, calibration 1.076).
-- Go/no-go at the validation nearest 4 hours (about step 40,000, about 80M decisions). Continue only if all hold:
-  - policy loss ≤ 0.250;
-  - play-rate calibration within 0.97–1.03;
+- Baseline on the same whole-battle validator: generalist-v2 scores 0.2354 (gate 0.1190, card 0.0270, tile 0.0894, calibration 1.076), 0.0014 above its row validator. To be measured again on the prefix set's validation battles.
+- Go/no-go at the validation nearest 4 hours. Continue only if all hold:
+  - the policy loss is no worse than generalist-v2's at the same number of play examples trained on (`plays_seen` in the metrics), plus the 0.0014 validator offset. generalist-v2 trained on 456 plays a step; its row-validator loss by plays seen:
+
+    | Plays seen | 2.5M | 5M | 10M | 20M | 30M | 40M |
+    |---|---:|---:|---:|---:|---:|---:|
+    | generalist-v2 | 0.2637 | 0.2508 | 0.2429 | 0.2371 | 0.2350 | 0.2339 |
+
+  - play-rate calibration no further from 1 than generalist-v2's (0.924–1.076);
   - zeroing the memory costs at least 0.002;
   - a 10-seed scorecard's median plays per minute within 20% of generalist-v2's at the same sampling.
 - Otherwise stop, and diagnose from the gate, card and tile split and the previous-action-hidden cost.

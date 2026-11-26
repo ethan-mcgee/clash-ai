@@ -111,3 +111,63 @@ def test_validation_scores_whole_seats_for_recurrent_and_plain_models(battles):
         assert np.isfinite(m["policy_nll"]) and m["policy_nll"] > 0
         assert m["policy_nll"] == pytest.approx(m["gate_nll"] + m["card_nll"] + m["tile_nll"])
         assert ("zero_state_cost" in m) == bool(flags)
+
+
+def _pair(battles, keep):
+    """The same chunk from two streams: every row's trunk gradient, and a ``keep`` share of the
+    waits'."""
+    from clashai.train.seq import Stream
+
+    items = battles.items(False, 12)
+    full = Stream(battles, items, 4, 48, 7, mirror=0.5, drop_prev=0.3)
+    part = Stream(battles, items, 4, 48, 7, mirror=0.5, drop_prev=0.3, wait_grad=keep)
+    return full.next(), part.next()
+
+
+def test_every_play_and_a_seeded_share_of_waits_train_the_trunk_and_the_groups_cover_every_row(
+        battles):
+    from clashai.train.seq import Stream
+
+    full, part = _pair(battles, 0.1)
+    _same({k: v for k, v in part.items() if k not in ("grad", "group_grad", "groups",
+                                                     "wait_grad")},
+          {k: v for k, v in full.items() if k != "groups"})
+    plays = part["actions"] != 0
+    assert part["grad"][plays].all()
+    share = part["grad"][~plays].mean()
+    assert 0.03 < share < 0.2, share
+    rows = np.concatenate([g[0] for g in part["groups"]])
+    assert sorted(rows.tolist()) == list(range(len(part["actions"])))
+    for (r, _, _), flag in zip(part["groups"], part["group_grad"], strict=True):
+        assert (part["grad"][r] == flag).all()
+    # Resumes exactly, the draw included.
+    s = Stream(battles, battles.items(False, 12), 4, 48, 7, mirror=0.5, drop_prev=0.3,
+               wait_grad=0.1)
+    snap = s.next()["snapshot"]
+    want = s.next()
+    again = Stream(battles, battles.items(False, 12), 4, 48, 7, mirror=0.5, drop_prev=0.3,
+                   wait_grad=0.1, snapshot=snap)
+    _same(again.next(), want)
+
+
+def test_sampling_the_trunks_waits_changes_no_output_and_no_gradient_after_the_trunk(battles):
+    from clashai.train.seq import chunk_losses, pin
+
+    full, part = (pin(b) for b in _pair(battles, 0.1))
+    grads, outs = [], []
+    for b in (full, part):
+        torch.manual_seed(0)
+        net = PolicyNet(battles.spec, Config(d=64, layers=2, heads=4, grid_channels=16,
+                                             attn_bias=True, relations=True, lstm=32,
+                                             prev_action=True)).train()  # dropout 0
+        loss, s, _ = chunk_losses(net, b, 4, None, loss_weight=0.5, value_weight=0.1)
+        loss.backward()
+        outs.append(loss.detach())
+        grads.append({n: q.grad.clone() for n, q in net.named_parameters() if q.grad is not None})
+    torch.testing.assert_close(outs[0], outs[1])
+    after = ("core.", "core_in.", "core_out.", "wait_head.", "slot_head.", "prev_kind.")
+    for n in grads[0]:
+        if n.startswith(after):
+            torch.testing.assert_close(grads[1][n], grads[0][n], rtol=1e-5, atol=1e-6, msg=n)
+    trunk = "trunk.layers.0.linear1.weight"
+    assert not torch.allclose(grads[1][trunk], grads[0][trunk])  # fewer waits, scaled up
