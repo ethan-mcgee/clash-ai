@@ -269,3 +269,61 @@ def test_the_policy_loss_splits_exactly_into_gate_card_and_tile(data):
     parts = sums["nll_gate"] + sums["nll_card"] + sums["nll_tile"]
     assert parts == pytest.approx(s["policy"] * sums["w"], rel=1e-4)
     assert sums["act_p"] > 0 and sums["act_w"] > 0
+
+
+def _tiny(spec, **flags):
+    return PolicyNet(spec, Config(d=64, layers=2, heads=4, grid_channels=16, **flags))
+
+
+def test_attention_biases_start_at_no_effect_and_learn(data):
+    from clashai.train.bc import forward_losses, to_device
+
+    _, spec, b = data
+    batch = to_device(b, "cpu")
+    torch.manual_seed(0)
+    biased = _tiny(spec, attn_bias=True, relations=True).eval()
+    plain = _tiny(spec).eval()
+    missing, unexpected = plain.load_state_dict(biased.state_dict(), strict=False)
+    assert not missing and unexpected  # the plain net lacks only the bias weights
+    with torch.no_grad():
+        a = biased(batch["header"], batch["entities"], batch["valid"])
+        p = plain(batch["header"], batch["entities"], batch["valid"])
+    torch.testing.assert_close(a["type_logits"], p["type_logits"], rtol=1e-4, atol=1e-4)
+    # Both biases get a gradient from the policy loss.
+    biased.train()
+    loss, _ = forward_losses(biased, batch, policy_rows="all", loss_weight=0.5)
+    loss.backward()
+    assert biased.pair_mlp[0][2].weight.grad.abs().sum() > 0
+    assert biased.relation_bias.grad.abs().sum() > 0
+    again = PolicyNet.from_description(biased.describe())
+    assert again.config.attn_bias and again.config.relations
+
+
+def test_relations_link_a_unit_to_its_target_and_never_to_padding(data):
+    _, spec, _ = data
+    net = _tiny(spec, relations=True)
+    e = torch.zeros(1, 4, spec.entity_ints, dtype=torch.int32)
+    ix = spec.entity
+    e[0, :, ix["id"]] = torch.tensor([7, 8, 9, 0])
+    e[0, :, ix["target"]] = torch.tensor([9, -1, 7, 0])  # 7 targets 9, 9 targets 7
+    valid = torch.tensor([[True, True, True, False]])  # the last row is padding (id 0, target 0)
+    t = net._pairs(e, valid)["targets"][0]
+    want = torch.zeros(4, 4)
+    want[0, 2] = want[2, 0] = 1
+    torch.testing.assert_close(t, want)
+
+
+def test_the_pair_features_are_zero_with_padding_and_symmetric_in_distance(data):
+    _, spec, _ = data
+    net = _tiny(spec, attn_bias=True)
+    e = torch.zeros(1, 3, spec.entity_ints, dtype=torch.int32)
+    ix = spec.entity
+    e[0, :, ix["x"]] = torch.tensor([3000, 15000, 9000])
+    e[0, :, ix["y"]] = torch.tensor([5000, 5000, 20000])
+    valid = torch.tensor([[True, True, False]])
+    f = net._pairs(e, valid)["features"][0]
+    assert (f[2] == 0).all() and (f[:, 2] == 0).all()
+    torch.testing.assert_close(f[0, 1, 0], torch.tensor(12000 / 8000))  # dx, key minus query
+    torch.testing.assert_close(f[1, 0, 0], torch.tensor(-12000 / 8000))
+    torch.testing.assert_close(f[0, 1, 4], f[1, 0, 4])  # distance
+    assert f[0, 1, 6] == 0 and f[0, 0, 6] == 1  # different lanes; same unit, same lane

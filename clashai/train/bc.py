@@ -322,6 +322,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--d", type=int, default=384)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--heads", type=int, default=6)
+    p.add_argument("--attn-bias", action="store_true",
+                   help="new models: bias unit-to-unit attention by their relative positions")
+    p.add_argument("--relations", action="store_true",
+                   help="new models: bias unit-to-unit attention where one targets the other")
     p.add_argument("--ema", type=float, default=0.9995,
                    help="decay of the averaged weights that are validated and saved (0: off)")
     p.add_argument("--value-only", action="store_true",
@@ -353,7 +357,8 @@ def main(argv: list[str] | None = None) -> None:
         assert net.spec.to_dict() == spec.to_dict(), "the rows' layout differs from the checkpoint's"
     else:
         net = PolicyNet(spec, Config(d=args.d, layers=args.layers, heads=args.heads,
-                                    dropout=args.dropout)).to(device)
+                                    dropout=args.dropout, attn_bias=args.attn_bias,
+                                    relations=args.relations)).to(device)
     print(f"{sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters", flush=True)
 
     keep = rows.piggies if args.policy_rows == "piggies" else np.ones(rows.n, bool)
@@ -380,7 +385,7 @@ def main(argv: list[str] | None = None) -> None:
         embeddings = ("card.", "cast.", "buff.", "token_type.", "position.", "kind.", "side.",
                       "state.")
         decay = [prm for n, prm in net.named_parameters()
-                 if prm.dim() >= 2 and not n.startswith(embeddings)]
+                 if prm.dim() >= 2 and not n.startswith(embeddings) and n != "relation_bias"]
         other = [prm for prm in net.parameters() if all(prm is not q for q in decay)]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
                              {"params": other, "weight_decay": 0.0}], lr=args.lr,

@@ -14,6 +14,14 @@ Heads:
 - belief: the enemy's hand now and the enemy's next card, as distributions over the vocabulary.
   Training targets come from the other seat's rows; the input never holds them.
 
+Optional, off in older checkpoints (each a :class:`Config` field):
+
+- ``attn_bias``: each trunk layer adds to the attention score between two units a per-head bias
+  from where they stand relative to each other (offset, distance, same lane, overlap), through a
+  small network of its own. Its last layer starts at zero, so a new model starts as without it.
+- ``relations``: each layer adds a learned per-head bias where one unit targets the other, and
+  another where it is targeted by it (an entity's ``target`` is the other's ``id``).
+
 Every amount is scaled here from crforge's integers, so the model takes the raw observation.
 """
 
@@ -48,6 +56,12 @@ class Config:
     grid_channels: int = 64
     max_entities: int = 80
     dropout: float = 0.0  # in the trunk's attention and feed-forward layers, while training
+    attn_bias: bool = False  # a bias on unit-to-unit attention from their positions
+    relations: bool = False  # a bias on unit-to-unit attention where one targets the other
+
+
+PAIR_FEATURES = 8
+PAIR_HIDDEN = 32
 
 
 def _onehot(x: torch.Tensor, n: int) -> torch.Tensor:
@@ -113,6 +127,16 @@ class PolicyNet(nn.Module):
         self.grid_out = nn.Conv2d(c, 1, 1)
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
+        heads, layers = self.config.heads, self.config.layers
+        if self.config.attn_bias:
+            self.pair_mlp = nn.ModuleList(
+                nn.Sequential(nn.Linear(PAIR_FEATURES, PAIR_HIDDEN), nn.GELU(),
+                              nn.Linear(PAIR_HIDDEN, heads)) for _ in range(layers))
+            for mlp in self.pair_mlp:
+                nn.init.zeros_(mlp[2].weight)
+                nn.init.zeros_(mlp[2].bias)
+        if self.config.relations:
+            self.relation_bias = nn.Parameter(torch.zeros(layers, 2, heads))
 
     def set_dropout(self, p: float) -> None:
         """Change the trunk's dropout, for a run that starts from another run's checkpoint."""
@@ -247,7 +271,9 @@ class PolicyNet(nn.Module):
     def encode(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor) -> dict:
         """The tokens through the trunk: the trunk's normalised output with what the heads need."""
         tokens, pad, fixed = self._tokens(header, entities, valid)
-        if torch.onnx.is_in_onnx_export():
+        if self.config.attn_bias or self.config.relations:
+            trunk = self.trunk_explicit(tokens, pad, self._pairs(entities, valid), fixed)
+        elif torch.onnx.is_in_onnx_export():
             trunk = self.trunk_explicit(tokens, pad)
         else:
             trunk = self.trunk(tokens, src_key_padding_mask=pad)
@@ -271,6 +297,45 @@ class PolicyNet(nn.Module):
                     "match": match, "hand": hand, "entities": out[:, fixed:],
                     "valid": enc["valid"], "entity_tile": enc["entity_tile"]}
 
+    def _pairs(self, entities: torch.Tensor, valid: torch.Tensor) -> dict:
+        """What every layer's attention bias reads, computed once in fp32: for each pair of units
+        (query i, key j), their relative position (``features``, (B, N, N, 8)) and whether i
+        targets j (``targets``, (B, N, N) float). A pair with a padded unit gets zeros."""
+        e, ix = entities.float(), self.spec.entity
+        pair = (valid[:, :, None] & valid[:, None, :]).float()
+        out = {}
+        if self.config.attn_bias:
+            x, y, r = e[..., ix["x"]], e[..., ix["y"]], e[..., ix["radius"]].clamp(min=0)
+            dx = x[:, None, :] - x[:, :, None]
+            dy = y[:, None, :] - y[:, :, None]
+            dist = torch.sqrt(dx * dx + dy * dy)
+            lane = x < self.spec.width / 2
+            same_lane = (lane[:, :, None] == lane[:, None, :]).float()
+            overlap = (dist < r[:, :, None] + r[:, None, :]).float()
+            s = 8000.0
+            features = torch.stack([dx / s, dy / s, dx.abs() / s, dy.abs() / s, dist / s,
+                                    torch.exp(-dist / 3000), same_lane, overlap], -1)
+            out["features"] = features * pair[..., None]
+        if self.config.relations:
+            target, ids = e[..., ix["target"]], e[..., ix["id"]]
+            hits = (target[:, :, None] == ids[:, None, :]) & (target >= 0)[:, :, None]
+            out["targets"] = hits.float() * pair
+        return out
+
+    def _layer_bias(self, layer: int, pairs: dict, fixed: int, pad: torch.Tensor) -> torch.Tensor:
+        """Layer ``layer``'s additive attention mask (B, heads, L, L): the units' pair bias, zero
+        for the first ``fixed`` tokens, and -inf at padded keys."""
+        bias = None
+        if "features" in pairs:
+            bias = self.pair_mlp[layer](pairs["features"])  # (B, N, N, heads)
+        if "targets" in pairs:
+            t = pairs["targets"]
+            w = self.relation_bias[layer].to(t.dtype)
+            rel = t[..., None] * w[0] + t.transpose(1, 2)[..., None] * w[1]
+            bias = rel if bias is None else bias + rel
+        bias = F.pad(bias.permute(0, 3, 1, 2).float(), (fixed, 0, fixed, 0))
+        return bias.masked_fill(pad[:, None, None, :], float("-inf"))
+
     @contextmanager
     def _head_precision(self, x: torch.Tensor):
         """Yields ``x`` as is, or in fp32 with autocast off (:attr:`fp32_heads`)."""
@@ -280,8 +345,11 @@ class PolicyNet(nn.Module):
         with torch.autocast(x.device.type, enabled=False):
             yield x.float()
 
-    def trunk_explicit(self, x: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
-        """The trunk's pre-norm layers written out with the same weights, for ONNX export.
+    def trunk_explicit(self, x: torch.Tensor, pad: torch.Tensor, pairs: dict | None = None,
+                       fixed: int = 0) -> torch.Tensor:
+        """The trunk's pre-norm layers written out with the same weights: for ONNX export, and
+        for the attention biases (``pairs`` from :meth:`_pairs`; the first ``fixed`` tokens are
+        not units and get none).
 
         PyTorch's attention layer records the sequence length as a constant when traced; this
         reshapes with -1 so the exported graph takes any number of units. Equal to ``self.trunk``
@@ -289,12 +357,13 @@ class PolicyNet(nn.Module):
         """
         b, heads, d = x.shape[0], self.config.heads, self.config.d
         keep = (~pad)[:, None, None, :]  # True where a key may be attended to
-        for layer in self.trunk.layers:
+        for i, layer in enumerate(self.trunk.layers):
             attn = layer.self_attn
             q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
             q, k, v = (t.reshape(b, -1, heads, d // heads).transpose(1, 2) for t in (q, k, v))
             p = attn.dropout if self.training else 0.0
-            a = F.scaled_dot_product_attention(q, k, v, attn_mask=keep, dropout_p=p)
+            mask = keep if pairs is None else self._layer_bias(i, pairs, fixed, pad).to(q.dtype)
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=p)
             x = x + layer.dropout1(attn.out_proj(a.transpose(1, 2).reshape(b, -1, d)))
             x = x + layer.dropout2(layer.linear2(layer.dropout(F.gelu(
                 layer.linear1(layer.norm2(x))))))
