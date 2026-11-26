@@ -505,12 +505,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--evaluate", help="only score this checkpoint on the validation battles")
     p.add_argument("--resume", action="store_true", help="carry on from last.pt if there is one")
     p.add_argument("--init", help="a checkpoint to start from (default: a new network)")
-    p.add_argument("--lanes", type=int, default=64, help="battle-seats per step")
+    p.add_argument("--lanes", type=int, default=128, help="battle-seats per step")
     p.add_argument("--chunk", type=int, default=32, help="consecutive decisions per lane a step")
     p.add_argument("--passes", type=float, default=3.0, help="passes over the training decisions")
     p.add_argument("--steps", type=int, default=0, help="steps (default: from --passes)")
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--warmup", type=int, default=3000)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup", type=int, default=1500)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--value-weight", type=float, default=0.1)
@@ -520,7 +520,7 @@ def main(argv: list[str] | None = None) -> None:
                    help="share of battle-seats whose previous actions are hidden")
     p.add_argument("--wait-grad", type=float, default=0.1,
                    help="share of waits whose gradient trains the trunk (1: all)")
-    p.add_argument("--ema", type=float, default=0.9995)
+    p.add_argument("--ema", type=float, default=0.999)
     p.add_argument("--d", type=int, default=384)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--heads", type=int, default=6)
@@ -528,7 +528,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--attn-bias", action=bool_flag, default=True)
     p.add_argument("--relations", action=bool_flag, default=True)
     p.add_argument("--prev-action", action=bool_flag, default=True)
-    p.add_argument("--eval-every", type=int, default=8000)
+    p.add_argument("--eval-every", type=int, default=4000)
     p.add_argument("--val-seats", type=int, default=600,
                    help="validation battle-seats for the periodic checks (0: all)")
     p.add_argument("--patience", type=int, default=3,
