@@ -29,6 +29,15 @@ Every ``--eval-every`` iterations after the warm-up, the snapshot plays a short 
 copied to ``best.pt``: the training
 score drifts with the league's draws, the scorecard does not.
 
+A recurrent network (the learner, the reference, a snapshot or the critic) keeps its core's state
+and the seat's own history per battle while the games are played (:class:`clashai.train.recurrent.Seats`),
+restarted with each game. The reference keeps two: the opponent's seat where it pilots, and the
+learner's seat, which it reads along with the learner to score the learner's actions. The update
+then trains on sequences of ``--seq`` consecutive decisions of one battle, each from the state the
+rollout had at its start, rather than on single decisions; the restart steps inside them carry no
+weight. A recurrent critic values the rollout in order, its state carried from one rollout to the
+next. Without any recurrent network nothing changes.
+
 A run writes ``<runs>/ppo/<name>/``: ``last.pt`` (with the optimiser and the league, to resume),
 ``pool/iter_NNNNN.pt`` every ``--snapshot-every`` iterations (playable by the scorecard),
 ``best.pt``, ``metrics.jsonl`` (one line an iteration) and ``evals.jsonl`` (one per scorecard).
@@ -44,7 +53,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from .. import paths
 from ..decks import PIGGIES_EQ
@@ -52,6 +60,8 @@ from ..model.policy import load_net
 from ..model.spec import unpack_masks
 from ..sim.env import make_vector
 from .league import League, opponent_decks
+from .longrun import keep_awake
+from .recurrent import Seats, batch_memory, join, sequence_rows, split_state
 
 NEG = -1e9
 DEFAULT_INIT = "bc/generalist/best.pt"
@@ -250,6 +260,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--steps", type=int, default=128, help="decisions per battle an iteration")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--minibatch", type=int, default=1024)
+    p.add_argument("--seq", type=int, default=0,
+                   help="decisions per training sequence (0: 16 when the learner or the critic is "
+                        "recurrent, single decisions otherwise)")
     p.add_argument("--lr", type=float, default=3e-6)
     p.add_argument("--critic-lr", type=float, default=3e-5)
     p.add_argument("--gamma", type=float, default=0.998)
@@ -277,14 +290,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--pool", type=int, default=5, help="recent snapshots the mirror games draw on")
     p.add_argument("--threads", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default="cuda", help="cpu for a small trial without the GPU")
     args = p.parse_args(argv)
     if args.eval_seeds and args.eval_every % args.snapshot_every:
         raise SystemExit("--eval-every must be a multiple of --snapshot-every: it scores snapshots")
 
+    keep_awake()  # a run of hours; Windows would otherwise sleep under it
     out_dir = paths.runs_dir() / "ppo" / args.name
     (out_dir / "pool").mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda")
-    torch.cuda.set_per_process_memory_fraction(0.8)
+    device = torch.device(args.device)
+    on_gpu = device.type == "cuda"
+    if on_gpu:
+        torch.cuda.set_per_process_memory_fraction(0.8)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
@@ -309,6 +326,9 @@ def main(argv: list[str] | None = None) -> None:
     spec, k = net.spec, net.config.max_entities
     pilots = Pilots(device, args.pool + 1)
     reference = pilots.get(reference_path)
+    seq = args.seq or (16 if net.config.lstm or critic_net.config.lstm else 0)
+    if seq and (args.steps % seq or args.minibatch % seq):
+        raise SystemExit("--steps and --minibatch must be multiples of --seq")
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-5,
                             weight_decay=0.0)
@@ -390,26 +410,75 @@ def main(argv: list[str] | None = None) -> None:
         "phi": np.zeros((steps, n), np.float32),
         "dones": np.zeros((steps, n), np.float32),
         "live": np.zeros((steps, n), bool),
+        # The learner's seat before each decision: whether its game starts there, and its history.
+        "first": np.zeros((steps, n), bool),
+        "prev_action": np.zeros((steps, n), np.int64),
+        "prev_card": np.zeros((steps, n), np.int64),
+        "since": np.zeros((steps, n), np.int64),
     }
+    # Memory per battle: the learner's seat as the learner reads it and as the reference reads
+    # it, and the opponent's seat as its pilot (the reference or a snapshot) reads it.
+    seats_own = Seats(n, net.config.lstm, spec, device)
+    seats_shadow = Seats(n, reference.config.lstm, spec, device)
+    seats_opp = Seats(n, max(reference.config.lstm, net.config.lstm), spec, device)
+    # The cores' states before each sequence's first decision, for the update; and the critic's
+    # running state, carried from one rollout to the next.
+    blocks = steps // seq if seq else 0
+    own_state = [np.zeros((blocks, n, max(1, net.config.lstm)), np.float32) for _ in range(2)]
+    crit_state = [np.zeros((blocks, n, max(1, critic_net.config.lstm)), np.float32)
+                  for _ in range(2)]
+    crit = [torch.zeros(n, max(1, critic_net.config.lstm), device=device) for _ in range(2)]
     log = open(out_dir / "metrics.jsonl", "a", encoding="utf-8")
     evals = open(out_dir / "evals.jsonl", "a", encoding="utf-8")
     t_start = time.time()
     arange = np.arange(n)
 
-    def forward(model, obs):
+    def forward(model, obs, memory=None):
+        """The network's output on observations, and the header it saw."""
         h, e, valid = seat_inputs(obs, spec, k, device)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = model(h, e, valid)
-        return out
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=on_gpu):
+            out = model(h, e, valid, memory)
+        return out, h
 
     @torch.no_grad()
     def values_of(obs: np.ndarray) -> np.ndarray:
         """The critic's values of ``(B, seat_ints)`` observations, in batches."""
         out = np.zeros(len(obs), np.float32)
         for a in range(0, len(obs), 4096):
-            o = forward(critic_net, obs[a:a + 4096])
+            o, _ = forward(critic_net, obs[a:a + 4096])
             out[a:a + 4096] = (o["value"].float() * value_scale).cpu().numpy()
         return out
+
+    @torch.no_grad()
+    def values_in_order(obs_flat: np.ndarray, flat: dict) -> np.ndarray:
+        """A recurrent critic's values of a rollout, ``(steps, n)``: sequence by sequence in
+        order, its state carried on from the rollout before and kept at each sequence's start
+        for the update."""
+        out = np.zeros(steps * n, np.float32)
+        per = max(1, 4096 // seq)
+        for j in range(blocks):
+            crit_state[0][j], crit_state[1][j] = crit[0].cpu().numpy(), crit[1].cpu().numpy()
+            for a in range(0, n, per):
+                lanes = np.arange(a, min(a + per, n))
+                rows = sequence_rows(j * n + lanes, seq, n)
+                memory = batch_memory(flat, rows, len(lanes),
+                                      (crit[0][a:a + per], crit[1][a:a + per]), device)
+                o, _ = forward(critic_net, obs_flat[rows], memory)
+                out[rows] = (o["value"].float() * value_scale).cpu().numpy()
+                crit[0][a:a + per] = o["state"][0][0].float()
+                crit[1][a:a + per] = o["state"][1][0].float()
+        return out.reshape(steps, n)
+
+    @torch.no_grad()
+    def values_next(obs: np.ndarray) -> np.ndarray:
+        """The critic's values of the decisions the rollout stopped before (its state is not
+        moved on: the next rollout values them again as its first rows)."""
+        if not critic_net.config.lstm:
+            return values_of(obs)
+        memory = {"lanes": n, "first": seats_own.fresh.clone(),
+                  "state": (crit[0][None], crit[1][None]), **seats_own.hist}
+        o, _ = forward(critic_net, obs, memory)
+        return (o["value"].float() * value_scale).cpu().numpy()
 
     def run_eval(label: str, checkpoint: str, it: int) -> float:
         t = time.time()
@@ -441,30 +510,44 @@ def main(argv: list[str] | None = None) -> None:
                 opp = obs_all[arange, 1 - seat]
                 opp_mask = masks_all[arange, 1 - seat].astype(bool)
                 with torch.no_grad():
-                    out = forward(net, own)
+                    buf["first"][t] = seats_own.fresh.cpu().numpy()
+                    for name, val in seats_own.hist.items():
+                        buf[name][t] = val.cpu().numpy()
+                    if seq and t % seq == 0:
+                        own_state[0][t // seq] = seats_own.h.cpu().numpy()
+                        own_state[1][t // seq] = seats_own.c.cpu().numpy()
+                    out, own_header = forward(net, own, seats_own.memory(net))
                     m = torch.from_numpy(own_mask).to(device)
                     actions, logp = sample(net, out, m, gen)
+                    seats_own.update(out["state"], own_header, actions)
                     # The reference pilots its opponents and scores the learner's actions in one
                     # forward pass.
                     ref_rows = np.flatnonzero([pl == reference_path for pl in pilot])
                     both = np.concatenate([opp[ref_rows], own])
                     both_mask = torch.from_numpy(np.concatenate([opp_mask[ref_rows], own_mask])
                                                  ).to(device)
-                    rout = forward(reference, both)
+                    rout, both_header = forward(
+                        reference, both, join(seats_opp.memory(reference, ref_rows),
+                                              seats_shadow.memory(reference)))
                     r = len(ref_rows)
+                    opp_state, shadow_state = split_state(rout["state"], r)
                     opp_actions = np.zeros(n, np.int64)
                     if r:
                         a, _ = sample(reference, _rows(rout, slice(0, r)), both_mask[:r], gen)
                         opp_actions[ref_rows] = a.cpu().numpy()
+                        seats_opp.update(opp_state, both_header[:r], a, ref_rows)
                     ref_logp, _ = evaluate_actions(reference, _rows(rout, slice(r, None)),
                                                    both_mask[r:], actions)
+                    # The reference follows the learner's seat through the learner's actions.
+                    seats_shadow.update(shadow_state, both_header[r:], actions)
                     for path in {pl for pl in pilot if pl != reference_path}:
                         rows = np.flatnonzero([pl == path for pl in pilot])
                         snap = pilots.get(path)
-                        sout = forward(snap, opp[rows])
+                        sout, snap_header = forward(snap, opp[rows], seats_opp.memory(snap, rows))
                         a, _ = sample(snap, sout, torch.from_numpy(opp_mask[rows]).to(device),
                                       gen)
                         opp_actions[rows] = a.cpu().numpy()
+                        seats_opp.update(sout["state"], snap_header, a, rows)
                 acts = actions.cpu().numpy()
                 buf["header"][t] = own[:, :hi]
                 buf["entities"][t] = own[:, hi:hi + width_ints]
@@ -494,6 +577,8 @@ def main(argv: list[str] | None = None) -> None:
                 # Battles restarted by this step start the game drawn for them.
                 for i in np.flatnonzero(restarting):
                     seat[i], deck[i], pilot[i], weight[i] = pending.pop(i)
+                for seats in (seats_own, seats_shadow, seats_opp):  # their next row starts a game
+                    seats.restart(np.flatnonzero(restarting))
                 restarting[:] = False
                 for i in np.flatnonzero(dones):
                     winner = int(v.infos[i, s.info["winner"]])
@@ -517,8 +602,9 @@ def main(argv: list[str] | None = None) -> None:
             # The critic values every row in one pass, and the battles as the rollout leaves them.
             flat = {key: val.reshape(steps * n, *val.shape[2:]) for key, val in buf.items()}
             obs_flat = np.concatenate([flat["header"], flat["entities"]], 1)
-            buf["values"][:] = values_of(obs_flat).reshape(steps, n)
-            last_values = values_of(v.observations[arange, seat])
+            buf["values"][:] = values_in_order(obs_flat, flat) if critic_net.config.lstm \
+                else values_of(obs_flat).reshape(steps, n)
+            last_values = values_next(v.observations[arange, seat])
             adv, ret = gae(buf["rewards"], buf["values"], buf["dones"], buf["live"],
                            last_values, args.gamma, args.lam)
 
@@ -536,20 +622,40 @@ def main(argv: list[str] | None = None) -> None:
             # -- update --
             t1 = time.time()
             net.train()
-            idx_all = np.flatnonzero(buf["live"].ravel())
+            live_f = buf["live"].ravel()
             adv_f, ret_f = adv.ravel(), ret.ravel()
             stats: dict = {}
+            # A minibatch is whole sequences (restart steps inside them weigh nothing), or single
+            # live decisions when nothing is recurrent.
+            units = np.arange(blocks * n) if seq else np.flatnonzero(live_f)
+            per_batch = args.minibatch // seq if seq else args.minibatch
             for _ in range(args.epochs):
-                order = rng.permutation(idx_all)
-                for start in range(0, len(order), args.minibatch):
-                    idx = np.sort(order[start:start + args.minibatch])
-                    if len(idx) < args.minibatch // 4:
+                order = rng.permutation(units)
+                for start in range(0, len(order), per_batch):
+                    pick = np.sort(order[start:start + per_batch])
+                    if len(pick) < per_batch // 4:
                         continue
+                    idx = sequence_rows(pick, seq, n) if seq else pick
+                    w = torch.from_numpy(live_f[idx]).to(device).float()
+                    total = w.sum().clamp(min=1)
+
+                    def mean(x, w=w, total=total):
+                        return (w * x).sum() / total
+
+                    def memory_of(model, states, pick=pick, idx=idx, flat=flat):
+                        if not model.config.lstm:
+                            return None
+                        j, i = np.divmod(pick, n)
+                        return batch_memory(flat, idx, len(pick),
+                                            (states[0][j, i], states[1][j, i]), device)
+
                     h, e, valid = seat_inputs(obs_flat[idx], spec, k, device)
                     target = torch.from_numpy(ret_f[idx]).to(device)
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        value = critic(critic_net, critic_net(h, e, valid), 1.0) * value_scale
-                    v_loss = F.mse_loss(value, target)
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=on_gpu):
+                        value = critic(critic_net, critic_net(h, e, valid,
+                                                              memory_of(critic_net, crit_state)),
+                                       1.0) * value_scale
+                    v_loss = mean((value - target) ** 2)
                     critic_opt.zero_grad(set_to_none=True)
                     v_loss.backward()
                     torch.nn.utils.clip_grad_norm_(critic_net.parameters(), 0.5)
@@ -562,15 +668,20 @@ def main(argv: list[str] | None = None) -> None:
                         old = torch.from_numpy(flat["logp"][idx]).to(device)
                         ref = torch.from_numpy(flat["ref_logp"][idx]).to(device)
                         a = torch.from_numpy(adv_f[idx]).to(device)
-                        a = (a - a.mean()) / (a.std() + 1e-8)
-                        with torch.autocast("cuda", dtype=torch.bfloat16):
-                            logp, entropy = evaluate_actions(net, net(h, e, valid), mask, acts_t)
+                        centre = mean(a)
+                        spread = torch.sqrt((w * (a - centre) ** 2).sum()
+                                            / (total - 1).clamp(min=1))
+                        a = (a - centre) / (spread + 1e-8)
+                        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=on_gpu):
+                            logp, entropy = evaluate_actions(
+                                net, net(h, e, valid, memory_of(net, own_state)), mask, acts_t)
+                        logp = torch.where(w > 0, logp, old)  # a restart step: ratio 1, no part
                         ratio = torch.exp(logp - old)
-                        pg = -torch.min(ratio * a,
-                                        ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
-                        d = ref - logp
-                        kl_ref = (torch.exp(d) - d - 1).mean()
-                        ent = entropy.mean()
+                        pg = -mean(torch.min(ratio * a,
+                                             ratio.clamp(1 - args.clip, 1 + args.clip) * a))
+                        d = torch.where(w > 0, ref - logp, torch.zeros_like(logp))
+                        kl_ref = mean(torch.exp(d) - d - 1)
+                        ent = mean(entropy)
                         loss = pg - args.ent_coef * ent + kl_coef * kl_ref
                         opt.zero_grad(set_to_none=True)
                         loss.backward()
@@ -578,8 +689,8 @@ def main(argv: list[str] | None = None) -> None:
                         opt.step()
                         batch_stats.update({
                             "policy_loss": pg, "entropy": ent, "kl_ref": kl_ref,
-                            "approx_kl": (old - logp).mean(),
-                            "clip_frac": ((ratio - 1).abs() > args.clip).float().mean()})
+                            "approx_kl": mean(old - logp),
+                            "clip_frac": mean(((ratio - 1).abs() > args.clip).float())})
                     with torch.no_grad():
                         for key, val in batch_stats.items():
                             stats[key] = stats.get(key, 0.0) + float(val)
