@@ -185,13 +185,13 @@ class PolicyNet(nn.Module):
     def _ids(self, header: torch.Tensor, name: str, table: int | None = None) -> torch.Tensor:
         """Vocabulary ids of a header field, + 1, with -1 (none, unknown) at 0."""
         n = self.spec.vocab if table is None else table
-        return header[:, self.spec.header[name]].long().clamp(-1, n - 1) + 1
+        return header[:, self.spec.columns[name]].long().clamp(-1, n - 1) + 1
 
     def _tokens(self, header: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor):
         hf = header.float()
 
         def H(name):
-            return hf[:, self.spec.header[name]]
+            return hf[:, self.spec.columns[name]]
 
         def col(x):
             return x.unsqueeze(-1)
@@ -211,7 +211,7 @@ class PolicyNet(nn.Module):
         nxt = self.card(self._ids(header, "next_card")) + typ[2]  # (B, 1, d)
         queue = self.card(self._ids(header, "queue")) + pos[:4] + typ[3]
 
-        slot_flags = header[:, self.spec.header["deck_slot"]].long()
+        slot_flags = header[:, self.spec.columns["deck_slot"]].long()
         deck = self.card(self._ids(header, "deck")) + self.deck_in(torch.stack([
             torch.remainder(slot_flags, 2).float(),
             torch.remainder(torch.div(slot_flags, 2, rounding_mode="floor"), 2).float(),
