@@ -60,6 +60,7 @@ from ..model.policy import load_net
 from ..model.spec import unpack_masks
 from ..sim.env import make_vector
 from .league import League, opponent_decks
+from .longrun import keep_awake
 from .recurrent import Seats, batch_memory, join, sequence_rows, split_state
 
 NEG = -1e9
@@ -294,6 +295,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.eval_seeds and args.eval_every % args.snapshot_every:
         raise SystemExit("--eval-every must be a multiple of --snapshot-every: it scores snapshots")
 
+    keep_awake()  # a run of hours; Windows would otherwise sleep under it
     out_dir = paths.runs_dir() / "ppo" / args.name
     (out_dir / "pool").mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
