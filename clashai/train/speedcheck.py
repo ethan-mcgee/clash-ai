@@ -99,7 +99,9 @@ def measure(mode: str, steps: int, extra: list[str]) -> dict:
         stop.set()
         shutil.rmtree(folder, ignore_errors=True)
     if code != 0:
-        return {"mode": mode, "error": f"exit {code}: " + "".join(lines[-12:]).strip()}
+        # From the first traceback: a CUDA error is often reported only by a later operation.
+        first = next((i for i, x in enumerate(lines) if x.startswith("Traceback")), len(lines) - 12)
+        return {"mode": mode, "error": f"exit {code}: " + "".join(lines[max(first, 0):][:40]).strip()}
     return summary(mode, windows(lines), gpu)
 
 

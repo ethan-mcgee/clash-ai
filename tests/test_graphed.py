@@ -64,11 +64,11 @@ def _plain_loop(battles, chunks, lrs, device="cpu"):
     return net, ema, state, stats
 
 
-def _run(battles, chunks, lrs, mode, device="cpu"):
+def _run(battles, chunks, lrs, mode, device="cpu", profiles=0):
     from clashai.train.graphed import Stepper
 
     net, opt, ema = _setup(battles, device)
-    stepper = Stepper(net, opt, ema, LANES, mode=mode, **LOSS)
+    stepper = Stepper(net, opt, ema, LANES, mode=mode, profiles=profiles, **LOSS)
     state, stats = None, []
     for at, (b, lr) in enumerate(zip(chunks, lrs, strict=True)):
         s, state = stepper.step(b, state, lr=lr, at=at)
@@ -138,6 +138,39 @@ def test_recorded_steps_train_as_ordinary_steps(battles):
     assert stepper.counts == {"recorded": 2, "ordinary": 4}
     _close(net, net2, 5e-3, 5e-5)
     _close(ema.net, ema2.net, 5e-3, 5e-5)
+    for x, y in zip(state, state2, strict=True):
+        torch.testing.assert_close(y, x, rtol=5e-3, atol=5e-4)
+    for s, s2 in zip(stats, stats2, strict=True):
+        assert s == pytest.approx(s2, rel=1e-3, abs=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_recordings_sharing_memory_replay_in_turn_as_ordinary_steps(battles):
+    """On the GPU: two recordings in one memory pool, replayed in turn, train as the plain loop
+    does; neither overwrites what the other needs. Neither is recorded before both are warmed
+    up. (Both profiles have the same shapes; what matters is that they are two recordings.)"""
+    from clashai.train.seq import Profile
+
+    profiles = (Profile((64, 48, 32), (192, 96, 64), 40),)
+    n = 10
+    packed = _chunks(battles, n, profiles, "cuda")
+    labels = [0, 0, 0, 0, 1, 1, 1, 0, 0, 1]
+    for b, label in zip(packed, labels, strict=True):
+        assert b["packed"] == 0
+        b["packed"] = label
+    plain = _chunks(battles, n, (), "cuda")
+    lrs = [2e-4 * (1 + i % 3) for i in range(n)]
+    net, ema, state, stats = _plain_loop(battles, plain, lrs, "cuda")
+    net2, ema2, state2, stats2, stepper = _run(battles, packed, lrs, "cuda", "cuda", profiles=2)
+    # Profile 0 is warm after step 2 but waits for profile 1 (steps 4-6): 7 records it, 8
+    # replays it, 9 records profile 1.
+    assert stepper.counts == {"recorded": 3, "ordinary": 7}
+    assert len(stepper.recorded) == 2
+    # Over 10 steps the GPU's arithmetic order alone moves weights about 1e-4 from the plain
+    # loop (8e-5 with no recording at all, 1.7e-4 with one recording or two); a replay that
+    # overwrote another's results would be far off.
+    _close(net, net2, 5e-3, 5e-4)
+    _close(ema.net, ema2.net, 5e-3, 5e-4)
     for x, y in zip(state, state2, strict=True):
         torch.testing.assert_close(y, x, rtol=5e-3, atol=5e-4)
     for s, s2 in zip(stats, stats2, strict=True):

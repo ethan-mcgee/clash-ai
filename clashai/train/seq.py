@@ -720,7 +720,7 @@ def main(argv: list[str] | None = None) -> None:
                     drop_prev=args.drop_prev, wait_grad=args.wait_grad, snapshot=snapshot,
                     profiles=profiles)
     stepper = Stepper(net, opt, ema, args.lanes, mode=args.graph, loss_weight=args.loss_weight,
-                      value_weight=args.value_weight)
+                      value_weight=args.value_weight, profiles=len(profiles))
     loader = Loader(stream)
     consumed = snapshot
 

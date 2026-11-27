@@ -71,7 +71,7 @@ class Stepper:
     """
 
     def __init__(self, net, opt, ema: EMA | None, lanes: int, *, mode: str = "off",
-                 clip: float = 1.0, loss_weight: float, value_weight: float):
+                 clip: float = 1.0, loss_weight: float, value_weight: float, profiles: int = 0):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         self.net, self.opt, self.ema, self.lanes, self.mode, self.clip = net, opt, ema, lanes, mode, clip
@@ -80,6 +80,11 @@ class Stepper:
         self.device = self.params[0].device
         self.recorded: dict[int, _Recording] = {}
         self.warm: dict[int, int] = {}
+        self.pool = None  # the recordings' shared memory (see _Recording)
+        # With the number of profiles known, none is recorded until every one is warmed up: an
+        # ordinary step beside a recording needs as much memory again, which a 24 GB card does
+        # not have. Until then every step is ordinary; after, only chunks that fit no profile.
+        self.profiles = profiles
         self.counts = {"recorded": 0, "ordinary": 0}
         self.lr = self.rate = None
         if mode != "off":
@@ -151,13 +156,16 @@ class Stepper:
             self.counts["ordinary"] += 1
             return self._ordinary(b, state, rate)
         if profile not in self.recorded:
-            if self.warm.get(profile, 0) < WARMUP:
+            if self.warm.get(profile, 0) < WARMUP or not self._all_warm():
                 self.warm[profile] = self.warm.get(profile, 0) + 1
                 self.counts["ordinary"] += 1
                 return self._warm_up(b, state, rate)
             self.recorded[profile] = _Recording(self, b)
         self.counts["recorded"] += 1
         return self.recorded[profile].replay(b, self._state(state))
+
+    def _all_warm(self) -> bool:
+        return sum(n >= WARMUP for n in self.warm.values()) >= self.profiles
 
     def _warm_up(self, b: dict, state, rate):
         """An ordinary step on a side stream, where PyTorch asks for warm-up steps to run."""
@@ -180,7 +188,16 @@ class _Recording:
         # Gradients are made anew inside the recording, in its own memory, and refilled in place
         # by each replay.
         owner.opt.zero_grad(set_to_none=True)
-        with torch.cuda.graph(self.graph):
+        # All recordings share one memory pool: each holds about a whole step's memory, and one
+        # per profile does not fit on a 24 GB card. Sharing is safe because the recordings never
+        # run at once and replay() copies out every result before another replay can overwrite
+        # it. The memory ordinary steps keep cached is freed first, for the pool to use: running
+        # out of memory while recording cannot be recovered from.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if owner.pool is None:
+            owner.pool = torch.cuda.graph_pool_handle()
+        with torch.cuda.graph(self.graph, pool=owner.pool):
             loss, self.stats, self.state = owner._forward(self.inputs, self.h, self.c)
             owner._update(loss, owner.rate)
 
