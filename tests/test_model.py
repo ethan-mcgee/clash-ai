@@ -327,3 +327,14 @@ def test_the_pair_features_are_zero_with_padding_and_symmetric_in_distance(data)
     torch.testing.assert_close(f[1, 0, 0], torch.tensor(-12000 / 8000))
     torch.testing.assert_close(f[0, 1, 4], f[1, 0, 4])  # distance
     assert f[0, 1, 6] == 0 and f[0, 0, 6] == 1  # different lanes; same unit, same lane
+
+
+def test_header_slices_pick_the_same_columns_as_the_lists(data):
+    """Spec.columns (slices, which a recorded CUDA graph can index with) equals Spec.header."""
+    spec = data[1]
+    header = torch.arange(len(spec.header_fields))[None].repeat(2, 1)
+    assert set(spec.columns) == set(spec.header)
+    for name, cols in spec.header.items():
+        assert header[:, spec.columns[name]].tolist() == header[:, cols].tolist(), name
+    with pytest.raises(ValueError, match="evenly spaced"):
+        Spec(["a", "b", "a", "a"], ["id"], 1, 1, 1, 1, 1, 1, 1, 1)

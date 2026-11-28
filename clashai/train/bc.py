@@ -171,10 +171,9 @@ def losses(net: PolicyNet, out: dict, b: dict, mask: torch.Tensor, actions: torc
     spec = net.spec
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=mask.is_cuda):
         kind, tile = spec.decode(actions)
-        n = len(kind)
-        ar = torch.arange(n, device=kind.device)
-        type_mask = spec.type_mask(mask)
-        type_mask[ar, kind] = True
+        # The taken action is always allowed. scatter_ with a scalar, not an index assignment
+        # of True: that copies the True to the device, which a recorded CUDA graph cannot do.
+        type_mask = spec.type_mask(mask).scatter_(1, kind[:, None], True)
         type_logits = out["type_logits"].float().masked_fill(~type_mask, NEG)
         nll_type = F.cross_entropy(type_logits, kind, reduction="none")
         if play_rows is None:
@@ -182,8 +181,7 @@ def losses(net: PolicyNet, out: dict, b: dict, mask: torch.Tensor, actions: torc
         elif metrics:
             raise ValueError("metrics need the play rows found, not given")
         slot = (kind[play_rows] - 1).clamp(0, spec.hand_slots - 1)  # in range on padding too
-        tile_mask = spec.tile_mask(mask[play_rows], slot)
-        tile_mask[torch.arange(len(play_rows), device=kind.device), tile[play_rows]] = True
+        tile_mask = spec.tile_mask(mask[play_rows], slot).scatter_(1, tile[play_rows, None], True)
         tile_logits = net.tile_logits(out, play_rows, slot).float().masked_fill(~tile_mask, NEG)
         nll_tile = F.cross_entropy(tile_logits, tile[play_rows], reduction="none")
         # The value head trains on a detached trunk (see the module notes); out["value"] is the

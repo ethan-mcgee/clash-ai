@@ -73,9 +73,14 @@ def advance(hist: dict, actions: torch.Tensor, cards: torch.Tensor) -> dict:
     return {"prev_action": actions.long(), "prev_card": cards.long(), "since": since}
 
 
+_EDGES: dict = {}
+
+
 def since_bucket(since: torch.Tensor, prev_action: torch.Tensor) -> torch.Tensor:
     """``since`` as a bucket index; the last bucket where the previous action is unknown."""
-    edges = torch.tensor(SINCE_EDGES, device=since.device)
+    edges = _EDGES.get(since.device)
+    if edges is None:  # made once per device, not copied anew each call (see Spec.columns)
+        edges = _EDGES[since.device] = torch.tensor(SINCE_EDGES, device=since.device)
     bucket = torch.bucketize(since, edges, right=True) - 1
     bucket = bucket.clamp(0, len(SINCE_EDGES) - 1)
     return torch.where(prev_action == UNKNOWN, torch.full_like(bucket, SINCE_BUCKETS - 1),

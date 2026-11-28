@@ -29,6 +29,10 @@ class Spec:
     vocab_hash: str = ""
     header: dict[str, list[int]] = field(init=False, repr=False)
     entity: dict[str, int] = field(init=False, repr=False)
+    columns: dict[str, slice] = field(init=False, repr=False)
+    """Each header field's columns as a slice, for indexing tensors: a list of columns is copied
+    to the device on every use, which a recorded CUDA graph cannot do. Every field's columns are
+    evenly spaced (repeated groups such as the pending plays), so a slice with a step holds them."""
 
     def __post_init__(self):
         header = defaultdict(list)
@@ -36,6 +40,12 @@ class Spec:
             header[name].append(i)
         self.header = dict(header)
         self.entity = {n: i for i, n in enumerate(self.entity_fields)}
+        self.columns = {}
+        for name, cols in self.header.items():
+            step = cols[1] - cols[0] if len(cols) > 1 else 1
+            if cols != list(range(cols[0], cols[-1] + 1, step)):
+                raise ValueError(f"header field {name}'s columns are not evenly spaced: {cols}")
+            self.columns[name] = slice(cols[0], cols[-1] + 1, step)
 
     @classmethod
     def from_metadata(cls, metadata: dict) -> Spec:
@@ -105,6 +115,7 @@ class Spec:
     def mirror_header(self, header: torch.Tensor) -> torch.Tensor:
         header = header.clone()
         w, h = self.width, self.header
+        h = self.columns
         pend_x, pend_card = h["pending_x"], h["pending_card"]
         header[:, pend_x] = torch.where(header[:, pend_card] >= 0, w - header[:, pend_x],
                                         header[:, pend_x])
@@ -112,8 +123,10 @@ class Spec:
         header[:, play_x] = torch.where(header[:, play_x] != -1, w - header[:, play_x],
                                         header[:, play_x])
         for left, right in TOWER_SWAP:
-            a, b = h[left][0], h[right][0]
-            header[:, [a, b]] = header[:, [b, a]]
+            a, b = self.header[left][0], self.header[right][0]
+            first = header[:, a].clone()
+            header[:, a] = header[:, b]
+            header[:, b] = first
         return header
 
     def mirror_entities(self, entities: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
