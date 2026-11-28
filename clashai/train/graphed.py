@@ -24,8 +24,11 @@ What changes with the mode, and why:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
+from .. import paths
 from .bc import EMA
 
 MODES = ("off", "cuda", "compile")
@@ -98,6 +101,7 @@ class Stepper:
                 g["capturable"] = self.device.type == "cuda"  # AdamW's own flag for recording
         self._compiled = None
         if mode == "compile":
+            _short_caches()
             self._compiled = torch.compile(self._forward, mode="reduce-overhead")
 
     # -- the step's parts ---------------------------------------------------------------------
@@ -209,3 +213,13 @@ class _Recording:
         # Copies: the recording's own outputs are overwritten by its next replay.
         return ({k: v.clone() for k, v in self.stats.items()},
                 None if self.state is None else tuple(x.detach().clone() for x in self.state))
+
+
+def _short_caches() -> None:
+    """Compiled kernels cached under the data folder, unless set otherwise: on Windows the
+    default, under the user's temp folder, makes file names too long for some tools, and the
+    data folder keeps them across temp clean-ups (a warm cache starts a run in about 3 minutes
+    instead of 15)."""
+    cache = paths.data_root() / "cache"
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache / "inductor"))
+    os.environ.setdefault("TRITON_CACHE_DIR", str(cache / "triton"))

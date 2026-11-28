@@ -175,3 +175,37 @@ def test_recordings_sharing_memory_replay_in_turn_as_ordinary_steps(battles):
         torch.testing.assert_close(y, x, rtol=5e-3, atol=5e-4)
     for s, s2 in zip(stats, stats2, strict=True):
         assert s == pytest.approx(s2, rel=1e-3, abs=1e-4)
+
+
+def _has_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not _has_triton(),
+                    reason="needs CUDA and Triton")
+def test_compiled_steps_train_as_ordinary_steps(battles):
+    """On the GPU with Triton: steps whose forward and losses are compiled end with the weights of
+    the plain loop, through a chunk that fits no profile (which runs uncompiled)."""
+    from clashai.train.seq import Profile
+
+    profiles = (Profile((64, 48, 32), (192, 96, 64), 40),)
+    packed = _chunks(battles, 6, profiles, "cuda")
+    plain = _chunks(battles, 6, (), "cuda")
+    unfit = copy.copy(plain[4])
+    unfit["packed"] = -1
+    packed[4] = unfit
+    net, ema, state, stats = _plain_loop(battles, plain, LRS, "cuda")
+    net2, ema2, state2, stats2, stepper = _run(battles, packed, LRS, "compile", "cuda")
+    assert stepper.counts == {"recorded": 0, "ordinary": 6}
+    # Compiled kernels add and multiply in another order than eager ones: weights move about as
+    # far apart as the recording's do over the same steps.
+    _close(net, net2, 5e-3, 5e-4)
+    _close(ema.net, ema2.net, 5e-3, 5e-4)
+    for x, y in zip(state, state2, strict=True):
+        torch.testing.assert_close(y, x, rtol=5e-3, atol=5e-3)
+    for s, s2 in zip(stats, stats2, strict=True):
+        assert s == pytest.approx(s2, rel=2e-3, abs=2e-4)
